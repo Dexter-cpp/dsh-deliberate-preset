@@ -1,0 +1,35 @@
+{
+  "name": "@local/dsh-deliberate-preset",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DeepSeek Harness 权衡模式：先评估代价，再分块执行，以阶段检查、显式假设和防循环规则促进任务收敛。",
+  "type": "module",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Dexter-cpp/dsh-deliberate-preset.git"
+  },
+  "homepage": "https://github.com/Dexter-cpp/dsh-deliberate-preset#readme",
+  "bugs": {
+    "url": "https://github.com/Dexter-cpp/dsh-deliberate-preset/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "agent-preset",
+    "deliberate",
+    "prompt-engineering"
+  ],
+  "files": [
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md"
+  ]
+}
