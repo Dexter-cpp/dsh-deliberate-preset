@@ -1,6 +1,6 @@
 # 权衡 · DSH 本地版
 
-版本 1.4.0。适用于方案选择、实施与排障。
+版本 1.4.1。适用于方案选择、实施与排障。
 
 工具组合：原始 22 项（不含 `session-memory`）保持不变，另新增 `loop-guard` 与 `session-memory`（后者承载 `deliberate_checkpoint` 断点）；`deliberate_hypotheses` 与 `deliberate_guard_stats` 注册在 `loop-guard` 内，不新增插件行。
 

@@ -632,12 +632,15 @@ function runChecks(sources, proofDir = DEFAULT_PROOF_DIR) {
   check('runtime-parity.json 与共享文件哈希一致', (() => {
     try {
       const manifest = JSON.parse(fs.readFileSync(path.join(PRESET_DIR, 'runtime-parity.json'), 'utf8'));
-      return Object.entries(manifest.files).every(([file, digest]) =>
-        createHash('sha256').update(fs.readFileSync(path.join(PRESET_DIR, file))).digest('hex') === digest);
+      // 与 sync-runtime.cjs / parity.test.cjs 一致：行尾归一化后再比较，LF 与 CRLF 检出等价。
+      const normalizedSha = file => createHash('sha256')
+        .update(fs.readFileSync(path.join(PRESET_DIR, file), 'utf8').replace(/^\uFEFF/, '').replace(/\r\n/g, '\n'), 'utf8')
+        .digest('hex');
+      return Object.entries(manifest.files).every(([file, digest]) => normalizedSha(file) === digest);
     } catch {
       return false;
     }
-  })(), '两仓共享文件必须逐字节一致');
+  })(), '两仓共享文件按 LF 归一化后一致');
 
   // ── R8：方向记录可被引用 ─────────────────────────────────────────────────
   check('loop-guard 维护方向记录并在卡住时引用',
