@@ -41,6 +41,8 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
+const { createHash } = require('node:crypto');
 const { spawn, execFileSync } = require('node:child_process');
 
 const PRESET_DIR = __dirname;
@@ -52,7 +54,7 @@ const EVAL_ROOT = path.join(PRESET_DIR, '.eval');
  * dsh-proof-preset、目录也可能叫别的，所以允许用 --proof-dir 或 DSH_PROOF_DIR 覆盖。
  * 读不到 cordis.patch.yml 时在静态断言前直接报错退出，不把空串喂给断言。
  */
-const DEFAULT_PROOF_DIR = path.join(PRESET_DIR, '..', 'proof-preset');
+const DEFAULT_PROOF_DIR = path.join(PRESET_DIR, '..', 'dsh-proof-preset');
 const RUN_STAMP = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
 const RUN_ROOT = path.join(EVAL_ROOT, 'run-' + RUN_STAMP);
 const isWindows = process.platform === 'win32';
@@ -125,6 +127,7 @@ function parseArgs(argv) {
     static: false,
     selfTest: false,
     update: true,
+    unit: true,
     dryRun: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -144,6 +147,7 @@ function parseArgs(argv) {
     else if (argument === '--static') options.static = true;
     else if (argument === '--self-test') options.selfTest = true;
     else if (argument === '--no-update') options.update = false;
+    else if (argument === '--no-unit') options.unit = false;
     else if (argument === '--dry-run') options.dryRun = true;
     else if (argument === '--help' || argument === '-h') {
       console.log(fs.readFileSync(__filename, 'utf8').split('*/')[0]);
@@ -220,6 +224,53 @@ function resolveHostManifest(dshPath) {
 }
 
 // ── 通用进程调用 ────────────────────────────────────────────────────────────
+
+/** 读取仓库当前 commit；没有 .git 时明确写"未采集"，不编造。 */
+function gitSha(dir) {
+  try {
+    return execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 15000 }).trim();
+  } catch {
+    return '未采集（无 .git）';
+  }
+}
+
+/** 从事件流里找模型标识；找不到就写"未采集"，不猜默认模型。 */
+function pickModel(events) {
+  for (const event of events ?? []) {
+    if (!event || typeof event !== 'object') continue;
+    if (typeof event.model === 'string' && event.model) return event.model;
+    if (event.model && typeof event.model.model === 'string') return event.model.model;
+  }
+  return '未采集';
+}
+
+/** 读取 dsh 版本；失败写"未采集"，不写死版本号。 */
+async function readDshVersion(dshPath) {
+  try {
+    const result = await runProcess({
+      command: dshCommand(dshPath, ['--version']),
+      cwd: PRESET_DIR,
+      timeoutMs: 20000,
+      label: 'version',
+    });
+    const line = String(result.stdout || '')
+      .split(/\r?\n/)
+      .map(item => item.trim())
+      .filter(Boolean)[0];
+    return line || '未采集';
+  } catch {
+    return '未采集';
+  }
+}
+
+/** 跑单元测试（不需要 dsh、不消耗额度）；失败即视为发布阻塞。 */
+function runUnitTests() {
+  const result = run(PRESET_DIR, process.execPath, ['--test'], 300000);
+  const text = String(result.output ?? '') + '\n' + String(result.error ?? '');
+  const pass = /# pass (\d+)/.exec(text);
+  const fail = /# fail (\d+)/.exec(text);
+  return { ok: result.ok, pass: pass ? Number(pass[1]) : 0, fail: fail ? Number(fail[1]) : 0, raw: text };
+}
 
 function killTree(child) {
   if (!child.pid) return;
@@ -412,16 +463,16 @@ function personaOf(text) {
 
 /** C1 / C3 / C4 / 防循环 在两个 preset 里必须同时满足的关键词（R11）。 */
 const PARITY_GROUPS = [
-  { rule: 'C1 发散（重述 + 2–3 方向 + 方向记录）', words: ['重述问题', '真正的目标', '2–3 个', '反直觉', '简单问答或单步小改可跳过', '_directions'] },
+  { rule: 'C1 发散（重述 + 1–3 方向 + 方向记录）', words: ['重述问题', '真正的目标', '1–3 个', '简单问答或单步小改跳过', '_directions'] },
   { rule: 'C3 断点（save/read/clear + 工具不可用兜底）', words: ['断点', 'clear', '工具不可用', '先核对断点'] },
   { rule: 'C4 交付（静态/运行分开 + 不编造）', words: ['静态检查与运行验证分开写', '不编造', '未验证'] },
-  { rule: '防循环（事前自检 + hook 计数 + 止损）', words: ['事前自检', 'loop-guard', '止损'] },
+  { rule: '防循环（失败重复 + 停滞 + 止损）', words: ['loop-guard', '止损', '没有新证据'] },
 ];
 
 /** README 里不允许再出现的过时表述（R12）。 */
 const STALE_README = ['纯配置', '无 JS', '不含 JS', '同错复现守卫'];
 
-function runChecks(sources) {
+function runChecks(sources, proofDir = DEFAULT_PROOF_DIR) {
   const checks = [];
   const check = (name, ok, detail) => checks.push({ name, ok: Boolean(ok), detail });
   const read = sourceOf(sources);
@@ -465,7 +516,7 @@ function runChecks(sources) {
 
   for (const mode of ['proof', 'deliberate']) {
     const persona = personaOf(patches[mode]);
-    const requiredPrefix = ['重述问题', '真正的目标', '反直觉', '逆向', '极端'];
+    const requiredPrefix = ['重述问题', '真正的目标', '1–3 个不同方向'];
     const requiredSuffix = ['不强制套固定结构'];
     check(`${mode} prefix 含重述/多方向关键词`,
       requiredPrefix.every(word => persona.prefix.includes(word)),
@@ -476,16 +527,15 @@ function runChecks(sources) {
   }
 
   const proofPersona = personaOf(patches.proof);
-  const proofWords = ['已严格证明', '未证，仅靠对拍/实验支撑', '二分', '逐项贪心', '仍反例',
-    'n=0', '全相同', '最大值', '负权', '溢出', '多测首尾', '事前自检',
-    '按输入规模', '按算法复杂度', '按本机算力'];
-  check('proof 对拍/证明/自检规则齐全',
+  const proofWords = ['已严格证明', '未证，仅靠对拍/实验支撑', '段删', '项删', '值缩减',
+    'counterexamples', 'WA', 'TLE', 'RE', 'proof_hypotheses', 'nextCheck', '合法输入空间'];
+  check('proof 对拍/证明/反例规则齐全',
     proofWords.every(word => proofPersona.suffix.includes(word)),
     proofWords.filter(word => !proofPersona.suffix.includes(word)).join(',') || 'ok');
 
   const deliberatePersona = personaOf(patches.deliberate);
-  const deliberateWords = ['改动文件数', '预计轮次', '是否不可逆', '可检验的通过条件', 'EVALUATION.md', '事前自检'];
-  check('deliberate 量化/施工图/自检规则齐全',
+  const deliberateWords = ['改动文件数', '预计轮次', '是否不可逆', '风险信号', '可检验的通过条件', 'deliberate_hypotheses', '没有新证据'];
+  check('deliberate 风险信号/施工图/止损规则齐全',
     deliberateWords.every(word => deliberatePersona.suffix.includes(word)),
     deliberateWords.filter(word => !deliberatePersona.suffix.includes(word)).join(',') || 'ok');
 
@@ -529,23 +579,65 @@ function runChecks(sources) {
     !/selfCheckEvery|selfChecks/.test(denyBlock) && !/state\.count/.test(selfBlock),
     'B1 只数连续调用次数，C2 只数用户轮次');
 
-  // ── R6：hook 自身异常降级为放行；签名有上限 ──────────────────────────────
+  // ── R6：hook 自身异常降级为放行；签名全量（无 8 KB 截断） ────────────────
   check('loop-guard 异常降级为放行 + 记日志',
     /catch \(error\)/.test(guardText) && guardText.includes('pre-execute 异常，已放行') &&
     guardText.includes('return decision ?? next()'),
     'try/catch + 放行 + stderr 日志');
-  check('loop-guard 签名/输出 hash 有上限',
-    guardText.includes('MAX_HASH_CHARS') && guardText.includes('function clamp') &&
-    guardText.includes('slice(0, MAX_HASH_CHARS)'),
-    '只取前 8 KB 参与 hash');
+  check('签名与输出哈希全量计算（无 8 KB 截断）',
+    !guardText.includes('MAX_HASH_CHARS') && guardText.includes('sig/v2') &&
+    guardText.includes('out/v2') && guardText.includes('function writeCanonical'),
+    'canonical 流式编码，前缀相同不再视为同一调用');
+  check('成功调用不被硬拦（只拦失败重复）',
+    guardText.includes('state.failed') && guardText.includes('denyOn') && guardText.includes('repeatFailure'),
+    'denyOn=failure + 失败链判断');
+  check('输出 streak 按工具隔离且覆盖非文本输出',
+    guardText.includes('state.streaks.get(exec.name)') && guardText.includes("type === 'image'") &&
+    guardText.includes('function hasOutput'),
+    '同工具才累计；图片/资源参与哈希');
 
   // ── R7：新配置可校验 + 有文档 ────────────────────────────────────────────
-  check('loop-guard 配置校验：非法值回退默认并告警',
-    guardText.includes('function resolvePositiveInt') && guardText.includes('不是正整数，已回退默认值'),
-    '0 / 负数 / 非数字 → 默认 3 + 告警');
-  check('两个 yml 都写了正整数默认配置',
-    ['proof', 'deliberate'].every(mode => /threshold:\s*3/.test(patches[mode]) && /selfCheckEvery:\s*3/.test(patches[mode])),
-    'threshold / selfCheckEvery 默认 3');
+  check('loop-guard 配置校验：非法值回退/夹取并告警',
+    guardText.includes('function resolveInt') && guardText.includes('不是整数，已回退默认值') &&
+    guardText.includes('夹取为'),
+    '0 / 负数 / 小数 → 回退；超上限 → 夹取 + 告警');
+  check('两个 yml 都写了显式默认配置',
+    ['proof', 'deliberate'].every(mode => /threshold:\s*3/.test(patches[mode])
+      && /stallRounds:\s*3/.test(patches[mode]) && /denyOn:\s*failure/.test(patches[mode])),
+    'threshold / stallRounds / denyOn');
+
+  // ── 1.4.0：共享运行时、假设账本、断点 v2、注入策略 ───────────────────────
+  const sharedFiles = ['state-bus.cjs', 'ledger.cjs', 'runtime-parity.json', 'sync-runtime.cjs'];
+  check('1.4.0 共享运行时文件齐全',
+    sharedFiles.every(file => fs.existsSync(path.join(PRESET_DIR, file))),
+    sharedFiles.filter(file => !fs.existsSync(path.join(PRESET_DIR, file))).join(',') || sharedFiles.join(', '));
+  check('loop-guard 注册假设账本与统计工具',
+    guardText.includes('name: HYPOTHESES_TOOL,') && guardText.includes('name: STATS_TOOL,') &&
+    guardText.includes('ledger.set') && guardText.includes('ledger.update'),
+    '账本在 loop-guard 内注册，不新增插件行');
+  const ledgerText = fs.existsSync(path.join(PRESET_DIR, 'ledger.cjs'))
+    ? fs.readFileSync(path.join(PRESET_DIR, 'ledger.cjs'), 'utf8')
+    : '';
+  check('假设账本状态机与预算上限存在',
+    ledgerText.includes('TRANSITIONS') && ledgerText.includes('falsified')
+    && ledgerText.includes('maxHypotheses'),
+    '五态 + 终态 + 数量上限');
+  check('断点 v2 + v1 迁移 + 投影脱敏',
+    memories.deliberate.includes('SCHEMA_VERSION = 2') && memories.deliberate.includes('function migrateV1')
+    && memories.deliberate.includes('redact(args.note'),
+    'v2 落盘、v1 可读、fold 阶段脱敏');
+  check('断点注入按事件触发而不是每轮重复',
+    memories.deliberate.includes('DEFAULT_INJECT_ON') && memories.deliberate.includes('injectOn'),
+    'resume / compaction / goal-change / milestone');
+  check('runtime-parity.json 与共享文件哈希一致', (() => {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(path.join(PRESET_DIR, 'runtime-parity.json'), 'utf8'));
+      return Object.entries(manifest.files).every(([file, digest]) =>
+        createHash('sha256').update(fs.readFileSync(path.join(PRESET_DIR, file))).digest('hex') === digest);
+    } catch {
+      return false;
+    }
+  })(), '两仓共享文件必须逐字节一致');
 
   // ── R8：方向记录可被引用 ─────────────────────────────────────────────────
   check('loop-guard 维护方向记录并在卡住时引用',
@@ -556,7 +648,7 @@ function runChecks(sources) {
   for (const mode of ['proof', 'deliberate']) {
     const memory = memories[mode];
     check(`${mode} 落盘前过滤敏感字段`,
-      memory.includes('SECRET_RULES') && memory.includes('function redact') && memory.includes('已过滤'),
+      memory.includes('SECRET_RULES') && memory.includes('function redact(text)') && memory.includes('已过滤'),
       '密钥/token/密码类字段');
     check(`${mode} 损坏断点隔离并重建`,
       memory.includes('quarantine') && memory.includes('.corrupt-') && memory.includes('按空断点重建'),
@@ -585,12 +677,17 @@ function runChecks(sources) {
     '故意改坏的副本必须被判失败');
 
   check('deliberate package.json 收录新增 JS',
-    ['loop-guard.cjs', 'loop-guard.test.cjs', 'memory.test.cjs', 'parity.test.cjs', 'evaluate.cjs', 'evaluate-answerer.cjs']
+    ['loop-guard.cjs', 'loop-guard.test.cjs', 'memory.test.cjs', 'parity.test.cjs', 'evaluate.cjs', 'evaluate-answerer.cjs',
+      'state-bus.cjs', 'ledger.cjs', 'runtime-parity.json', 'sync-runtime.cjs']
       .every(file => (packages.deliberate?.files ?? []).includes(file)),
     (packages.deliberate?.files ?? []).join(', '));
   check('proof package.json 收录 loop-guard.cjs 与 CHANGELOG.md',
-    ['loop-guard.cjs', 'memory.cjs', 'CHANGELOG.md'].every(file => (packages.proof?.files ?? []).includes(file)),
+    ['loop-guard.cjs', 'memory.cjs', 'CHANGELOG.md', 'state-bus.cjs', 'ledger.cjs', 'runtime-parity.json']
+      .every(file => (packages.proof?.files ?? []).includes(file)),
     (packages.proof?.files ?? []).join(', '));
+  check('两个仓库都有迁移文档',
+    fs.existsSync(path.join(PRESET_DIR, 'MIGRATION.md')) && fs.existsSync(path.join(proofDir, 'MIGRATION.md')),
+    'MIGRATION.md：断点迁移、配置新增、回滚步骤');
 
   check('评测器为三态',
     read('evaluate.cjs').includes(AUTO_PASS) && read('evaluate.cjs').includes(AUTO_FAIL) && read('evaluate.cjs').includes(MANUAL),
@@ -647,8 +744,8 @@ const NEGATIVE_CASES = [
     expect: 'proof memory.cjs 已删除旧防循环守卫',
   },
   {
-    name: 'proof prefix 删掉“反直觉”',
-    mutate: sources => { sources.proofPatch = sources.proofPatch.replace('反直觉/逆向/极端', '别的角度'); },
+    name: 'proof prefix 删掉“1–3 个不同方向”',
+    mutate: sources => { sources.proofPatch = sources.proofPatch.replace('1–3 个不同方向', '若干方向'); },
     expect: 'proof prefix 含重述/多方向关键词',
   },
   {
@@ -694,12 +791,32 @@ const NEGATIVE_CASES = [
     mutate: sources => { sources.deliberateChangelog = sources.deliberateChangelog.replace('deliberate 原始 22 项', '原始 23 行工具组合不变'); },
     expect: '工具组合表述按 preset 分开',
   },
+  {
+    name: '把 8 KB 截断塞回签名',
+    mutate: sources => { sources.deliberateGuard = sources.deliberateGuard.replace('function signature(name, args) {', 'const MAX_HASH_CHARS = 8192;\nfunction signature(name, args) {'); },
+    expect: '签名与输出哈希全量计算（无 8 KB 截断）',
+  },
+  {
+    name: '去掉失败门控（成功也拦）',
+    mutate: sources => { sources.deliberateGuard = sources.deliberateGuard.split('state.failed').join('true'); },
+    expect: '成功调用不被硬拦（只拦失败重复）',
+  },
+  {
+    name: '断点 schema 退回只认 v1',
+    mutate: sources => { sources.deliberateMemory = sources.deliberateMemory.replace('SCHEMA_VERSION = 2', 'SCHEMA_VERSION = 1'); },
+    expect: '断点 v2 + v1 迁移 + 投影脱敏',
+  },
+  {
+    name: '把假设账本挪出 loop-guard',
+    mutate: sources => { sources.deliberateGuard = sources.deliberateGuard.replace('name: HYPOTHESES_TOOL,', "name: 'x_hypotheses',"); },
+    expect: 'loop-guard 注册假设账本与统计工具',
+  },
 ];
 
 /** 不需要 dsh：先确认正向全过，再确认每条负向用例都被判失败。 */
 function selfTest(proofDir = DEFAULT_PROOF_DIR) {
   const base = collectSources(PRESET_DIR, proofDir);
-  const positives = runChecks(base);
+  const positives = runChecks(base, proofDir);
   const failed = positives.filter(check => !check.ok);
   for (const check of positives) console.log(`  [${check.ok ? 'OK' : 'FAIL'}] ${check.name}（${check.detail}）`);
   if (failed.length > 0) {
@@ -710,7 +827,7 @@ function selfTest(proofDir = DEFAULT_PROOF_DIR) {
   for (const item of NEGATIVE_CASES) {
     const copy = JSON.parse(JSON.stringify(base));
     item.mutate(copy);
-    const checks = runChecks(copy);
+    const checks = runChecks(copy, proofDir);
     const target = checks.find(check => check.name === item.expect);
     if (!target) {
       console.error(`  [FAIL] ${item.name}：找不到断言「${item.expect}」`);
@@ -734,7 +851,7 @@ function selfTest(proofDir = DEFAULT_PROOF_DIR) {
 }
 
 async function runStatic(dshPath, proofDir = DEFAULT_PROOF_DIR) {
-  const checks = runChecks(collectSources(PRESET_DIR, proofDir));
+  const checks = runChecks(collectSources(PRESET_DIR, proofDir), proofDir);
   const dumps = [
     ['proof', path.join(proofDir, 'cordis.patch.yml')],
     ['deliberate', PATCH_PATH],
@@ -1263,10 +1380,11 @@ function updateEvaluation(results, meta) {
     ...(meta.partial ? [`本次只重跑了用例 ${[...results.keys()].sort((a, b) => a - b).join(', ')}，其余行沿用上次结果。`] : []),
     '',
     `静态断言：${meta.staticPassed} 通过 / ${meta.staticFailed} 失败。`,
+    ...(meta.unit ? [`单元测试：${meta.unit.pass} 通过 / ${meta.unit.fail} 失败（node --test，不需要 dsh）。`] : []),
     '',
     '| # | 状态 | 依据 |',
     '| --- | --- | --- |',
-    ...rows.map(([id, entry]) => `| ${id} | ${entry.status} | ${entry.basis.replace(/\|/g, '\\|')} |`),
+    ...rows.map(([id, entry]) => `| ${id} | ${entry.status} | ${(results.has(id) ? '' : '［沿用上次结果］') + entry.basis.replace(/\|/g, '\\|')} |`),
     '',
     '> **脚本判定≠真实通过。** 自动通过/自动失败只覆盖能确定性核验的部分（文件结果、命令退出码、拒绝码、关键词粗筛）；标「待人工复测」的必须人工看会话记录。原始记录在 `deliberate-preset/.eval/`。',
     endMarker,
@@ -1339,6 +1457,16 @@ async function main() {
     console.error(`静态断言失败 ${staticFailed.length} 项；先修复再跑模型行为。`);
     process.exitCode = 1;
     return;
+  }
+  let unit = { ok: true, pass: 0, fail: 0 };
+  if (options.unit) {
+    unit = runUnitTests();
+    console.log(`单元测试：${unit.pass} 通过 / ${unit.fail} 失败`);
+    if (!unit.ok) {
+      console.error('单元测试失败；先修复再跑行为用例。');
+      process.exitCode = 1;
+      return;
+    }
   }
   if (options.static) {
     console.log(`静态断言全部通过（${staticChecks.length} 项）。`);
@@ -1455,9 +1583,22 @@ async function main() {
   }
 
   if (options.update) {
+    const allEvents = caseResults.flatMap(item => item.transcripts.flatMap(entry => entry.run.events ?? []));
+    const model = pickModel(allEvents);
+    const permissions = [...new Set(cases.map(item => item.permissionMode ?? 'danger-full-access'))].join(' / ');
+    const versionText = await readDshVersion(dshPath);
     updateEvaluation(results, {
       time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }),
-      environment: `DSH 0.2.2-rc.5；Windows；模型 deepseek-flash（headless 默认）`,
+      environment: [
+        'DSH ' + versionText,
+        os.platform() + ' ' + os.release() + ' (' + os.arch() + ')',
+        'Node ' + process.version,
+        '模型 ' + model,
+        '权限 ' + permissions,
+        'proof ' + gitSha(proofDir).slice(0, 12),
+        'deliberate ' + gitSha(PRESET_DIR).slice(0, 12),
+      ].join('；'),
+      unit: options.unit ? unit : null,
       command: 'node evaluate.cjs' + (options.only ? ' --only ' + options.only.join(',') : ''),
       partial: Boolean(options.only && options.only.length !== CASES.length),
       staticPassed: staticChecks.filter(check => check.ok).length,

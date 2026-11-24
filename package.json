@@ -1,8 +1,8 @@
 {
   "name": "@local/dsh-deliberate-preset",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "private": true,
-  "description": "DeepSeek Harness 权衡模式：先评估代价，再分块执行；带运行时防循环硬拦截，并可自动跑 19 个行为用例。",
+  "description": "DeepSeek Harness 权衡模式：先评估代价，再分块执行；假设账本 + 状态触发的止损，另带 19 个行为用例评测。",
   "type": "module",
   "dsh": {
     "bundle": {
@@ -25,6 +25,12 @@
     "deliberate",
     "prompt-engineering"
   ],
+  "scripts": {
+    "test": "node --test loop-guard.test.cjs memory.test.cjs parity.test.cjs",
+    "parity": "node sync-runtime.cjs --check",
+    "eval:static": "node evaluate.cjs --static",
+    "eval:self-test": "node evaluate.cjs --self-test"
+  },
   "files": [
     "cordis.patch.yml",
     "README.md",
@@ -32,11 +38,16 @@
     "THIRD_PARTY_NOTICES.md",
     "CHANGELOG.md",
     "EVALUATION.md",
+    "MIGRATION.md",
     "memory.cjs",
     "loop-guard.cjs",
+    "state-bus.cjs",
+    "ledger.cjs",
+    "runtime-parity.json",
     "loop-guard.test.cjs",
     "memory.test.cjs",
     "parity.test.cjs",
+    "sync-runtime.cjs",
     "evaluate.cjs",
     "evaluate-answerer.cjs"
   ]

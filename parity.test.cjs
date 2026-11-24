@@ -1,49 +1,37 @@
 'use strict';
 
 /**
- * 两个 preset 的一致性测试（R1 / R11）。
+ * 一致性测试：共享运行时文件必须与 runtime-parity.json 的哈希一致。
  * 运行：node --test parity.test.cjs
  *
- * R1：proof 与 deliberate 都必须注册 loop-guard，且 proof 的 memory.cjs 里不能残留旧防循环守卫。
- * R11：C1（发散）/ C3（断点）/ C4（交付）/ 防循环 的语义必须一致，措辞可不同。
+ * 1.3.1 的 parity 测试要求另一个仓库的目录与它并排，单独 clone 任一仓库都会失败。
+ * 1.4.0 改为**哈希清单**：每个仓库自带一份期望哈希，改动共享文件而忘了同步时，
+ * 两边都会在本地失败，不需要另一个仓库在场。
  */
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
 
 const ROOT = __dirname;
-const PROOF_DIR = path.join(ROOT, '..', 'proof-preset');
-const DELIBERATE_DIR = ROOT;
-const read = file => fs.readFileSync(file, 'utf8');
+const read = file => fs.readFileSync(path.join(ROOT, file), 'utf8');
+const sha = file => createHash('sha256').update(fs.readFileSync(path.join(ROOT, file))).digest('hex');
 
-const SOURCES = {
-  proof: {
-    dir: PROOF_DIR,
-    patch: read(path.join(PROOF_DIR, 'cordis.patch.yml')),
-    memory: read(path.join(PROOF_DIR, 'memory.cjs')),
-    guard: read(path.join(PROOF_DIR, 'loop-guard.cjs')),
-    pkg: JSON.parse(read(path.join(PROOF_DIR, 'package.json'))),
-  },
-  deliberate: {
-    dir: DELIBERATE_DIR,
-    patch: read(path.join(DELIBERATE_DIR, 'cordis.patch.yml')),
-    memory: read(path.join(DELIBERATE_DIR, 'memory.cjs')),
-    guard: read(path.join(DELIBERATE_DIR, 'loop-guard.cjs')),
-    pkg: JSON.parse(read(path.join(DELIBERATE_DIR, 'package.json'))),
-  },
-};
+const manifest = JSON.parse(read('runtime-parity.json'));
+const pkg = JSON.parse(read('package.json'));
+const guard = read('loop-guard.cjs');
+const memory = read('memory.cjs');
+const patch = read('cordis.patch.yml');
 
-/** 取 persona 的 prefix / suffix 块标量（只认本项目 yml 的固定缩进）。 */
-function extractPersona(text) {
-  const lines = text.split(/\r?\n/);
-  const personaAt = lines.findIndex(line => /^\s*-\s+id:\s*persona\s*$/.test(line));
-  assert.ok(personaAt >= 0, 'cordis.patch.yml 里找不到 - id: persona');
+function personaText() {
+  const lines = patch.split(/\r?\n/);
+  const start = lines.findIndex(line => /^\s*-\s+id:\s*persona\s*$/.test(line));
+  assert.ok(start >= 0, 'cordis.patch.yml 缺少 persona');
   const collect = key => {
-    const pattern = new RegExp('^\\s*' + key + ':\\s*\\|-\\s*$');
-    const at = lines.findIndex((line, index) => index > personaAt && pattern.test(line));
-    assert.ok(at > personaAt, `persona 缺少 ${key} 块`);
+    const at = lines.findIndex((line, index) => index > start && new RegExp('^\\s*' + key + ':\\s*\\|-\\s*$').test(line));
+    assert.ok(at > start, 'persona 缺少 ' + key);
     const indent = lines[at].search(/\S/);
     const body = [];
     for (let index = at + 1; index < lines.length; index += 1) {
@@ -54,127 +42,102 @@ function extractPersona(text) {
     }
     return body.join('\n');
   };
-  return { prefix: collect('prefix'), suffix: collect('suffix') };
+  return collect('prefix') + '\n' + collect('suffix');
 }
 
-// ── R1 ─────────────────────────────────────────────────────────────────────
-
-test('R1 两个 cordis.patch.yml 都注册了 loop-guard，且指向各自的包', () => {
-  const rows = {
-    proof: /^ {10}- id: loop-guard$/m.test(SOURCES.proof.patch),
-    deliberate: /^ {10}- id: loop-guard$/m.test(SOURCES.deliberate.patch),
-  };
-  assert.equal(rows.proof, true, 'proof 缺少 loop-guard 注册');
-  assert.equal(rows.deliberate, true, 'deliberate 缺少 loop-guard 注册');
-  assert.match(SOURCES.proof.patch, /name: '@local\/dsh-proof-preset\/loop-guard\.cjs'/);
-  assert.match(SOURCES.deliberate.patch, /name: '@local\/dsh-deliberate-preset\/loop-guard\.cjs'/);
-  // 配置项必须显式写出，且默认值为正整数 3
-  for (const mode of ['proof', 'deliberate']) {
-    assert.match(SOURCES[mode].patch, /threshold:\s*3/, `${mode} 缺少 threshold`);
-    assert.match(SOURCES[mode].patch, /selfCheckEvery:\s*3/, `${mode} 缺少 selfCheckEvery`);
+test('runtime-parity.json 覆盖全部共享文件且哈希一致', () => {
+  assert.equal(manifest.version, pkg.version, '清单版本应与 package.json 一致');
+  const files = Object.keys(manifest.files);
+  assert.ok(files.length >= 6, '共享文件至少 6 个');
+  for (const file of files) {
+    assert.ok(fs.existsSync(path.join(ROOT, file)), file + ' 不存在');
+    assert.equal(sha(file), manifest.files[file], file + ' 与清单哈希不一致（共享文件被单边修改）');
   }
 });
 
-test('R1 loop-guard 在 session-memory 之前注册，先拿到调用', () => {
-  for (const mode of ['proof', 'deliberate']) {
-    const patch = SOURCES[mode].patch;
-    const guardAt = patch.search(/^ {10}- id: loop-guard$/m);
-    const memoryAt = patch.search(/^ {10}- id: session-memory$/m);
-    assert.ok(guardAt > 0 && memoryAt > 0, `${mode} 缺少行`);
-    assert.ok(guardAt < memoryAt, `${mode} 的 loop-guard 应排在 session-memory 之前`);
+test('package.json 收录新增文件与版本号', () => {
+  for (const file of ['state-bus.cjs', 'ledger.cjs', 'loop-guard.cjs', 'memory.cjs', 'runtime-parity.json']) {
+    assert.ok(pkg.files.includes(file), 'package.json files 缺少 ' + file);
+  }
+  assert.equal(pkg.version, '1.4.0');
+});
+
+test('测试与评测代码不依赖相邻仓库目录', () => {
+  for (const file of ['loop-guard.test.cjs', 'memory.test.cjs', 'parity.test.cjs']) {
+    const text = read(file);
+    assert.doesNotMatch(text, /\.\.\/(proof|deliberate)-preset/, file + ' 仍引用相邻目录');
+    assert.doesNotMatch(text, /dsh-(proof|deliberate)-preset\//, file + ' 仍引用仓库名路径');
   }
 });
 
-test('R1 proof 的 memory.cjs 已无旧防循环守卫，也不再注入换路提示', () => {
-  for (const mode of ['proof', 'deliberate']) {
-    const memory = SOURCES[mode].memory;
-    assert.doesNotMatch(memory, /ctx\.tools\.guard/, `${mode} 仍残留 ctx.tools.guard`);
-    assert.doesNotMatch(memory, /REPEATED_IDENTICAL_FAILURE/, `${mode} 仍残留拒绝码`);
-    assert.doesNotMatch(memory, /已连续 .* 次以相同参数/, `${mode} 仍残留换路提示`);
+test('共享实现已移除 8 KB 截断，签名与输出哈希为 v2', () => {
+  assert.doesNotMatch(guard, /MAX_HASH_CHARS/, '不得再按 8 KB 截断');
+  assert.match(guard, /sig\/v2/);
+  assert.match(guard, /out\/v2/);
+  assert.match(guard, /function writeCanonical/);
+});
+
+test('硬拦截只针对失败重复（成功不得误判）', () => {
+  assert.match(guard, /state\.failed/, '拦截条件必须检查上一次是否失败');
+  assert.match(guard, /denyOn/, '必须可配置 denyOn');
+  assert.match(guard, /repeatFailure/);
+});
+
+test('输出 streak 按工具隔离，且覆盖非文本输出', () => {
+  assert.match(guard, /state\.streaks\.get\(exec\.name\)/, 'streak 必须按工具取');
+  assert.match(guard, /type === 'image'/, '图片块必须参与输出哈希');
+  assert.match(guard, /function hasOutput/);
+});
+
+test('断点 v2 + v1 迁移 + 投影脱敏 + 注入策略齐全', () => {
+  assert.match(memory, /SCHEMA_VERSION = 2/);
+  assert.match(memory, /function migrateV1/);
+  assert.match(memory, /redact\(args\.note/, 'fold 阶段必须脱敏');
+  assert.match(memory, /DEFAULT_INJECT_ON/);
+  assert.match(memory, /EPERM/);
+});
+
+test('loop-guard 在 session-memory 之前注册，工具组合未新增行', () => {
+  const guardAt = patch.search(/^ {10}- id: loop-guard$/m);
+  const memoryAt = patch.search(/^ {10}- id: session-memory$/m);
+  assert.ok(guardAt > 0 && memoryAt > 0 && guardAt < memoryAt);
+  const rows = patch.split(/\r?\n/).map(line => /^ {10}- id:\s*(\S+)\s*$/.exec(line)).filter(Boolean).map(m => m[1]);
+  assert.equal(rows[0], 'persona');
+  assert.ok(rows.includes('loop-guard') && rows.includes('session-memory'));
+  assert.ok(!rows.includes('hypotheses'), '假设账本应注册在 loop-guard 内，不新增插件行');
+});
+
+test('persona 覆盖目标/证据/验证/止损/交付五个语义槽位', () => {
+  const text = personaText();
+  const slots = ['目标', '证据', '验证', '止损', '静态检查与运行验证分开写'];
+  const missing = slots.filter(word => !text.includes(word));
+  assert.deepEqual(missing, [], '缺少语义槽位：' + missing.join('、'));
+  assert.match(text, /_hypotheses/);
+  assert.match(text, /_checkpoint/);
+});
+
+test('persona 不再强制“反直觉方向”或固定边界清单', () => {
+  const text = personaText();
+  assert.doesNotMatch(text, /至少一个方向要反直觉/);
+  assert.doesNotMatch(text, /逐项勾选/);
+  assert.doesNotMatch(text, /与本题无关的写/);
+  assert.match(text, /1–3 个不同方向|1–3 个方向/);
+});
+
+test('假设账本状态机与预算上限存在', () => {
+  const ledger = read('ledger.cjs');
+  for (const status of ['untested', 'testing', 'supported', 'falsified', 'blocked']) {
+    assert.ok(ledger.includes(status), '缺少状态 ' + status);
   }
+  assert.match(ledger, /TRANSITIONS/);
+  assert.match(ledger, /maxHypotheses/);
+  assert.match(ledger, /falsified 是终态|falsified 不能重开/);
 });
 
-test('R1 两份实现逐字节一致，靠 package.json 名字区分模式', () => {
-  assert.equal(SOURCES.proof.memory, SOURCES.deliberate.memory, '两份 memory.cjs 应完全一致');
-  assert.equal(SOURCES.proof.guard, SOURCES.deliberate.guard, '两份 loop-guard.cjs 应完全一致');
-});
-
-test('R1 proof 的 loop-guard 能独立工作：第 4 次相同调用被拒绝', async () => {
-  const guard = require(path.join(PROOF_DIR, 'loop-guard.cjs'));
-  assert.equal(guard._internals.MODE, 'proof');
-  assert.equal(guard._internals.CHECKPOINT_TOOL, 'proof_checkpoint');
-  assert.equal(guard._internals.DIRECTIONS_TOOL, 'proof_directions');
-
-  const listeners = new Map();
-  const ctx = {
-    tools: { register() {} },
-    on(event, listener) { listeners.set(event, [...(listeners.get(event) ?? []), listener]); return () => {}; },
-  };
-  await guard.apply(ctx, { threshold: 3 });
-  const agent = { id: 'proof-smoke' };
-  const args = { command: 'node -e "process.exit(7)"' };
-  const call = () => {
-    let index = 0;
-    const list = listeners.get('tools/pre-execute') ?? [];
-    const run = async () => (index < list.length ? list[index++]({ name: 'pwsh', arguments: args, agent }, run) : { kind: 'allow' });
-    return run();
-  };
-  const emit = async text => {
-    for (const listener of listeners.get('tools/result') ?? []) {
-      await listener({ name: 'pwsh', arguments: args, agent }, { isError: true, content: [{ type: 'text', text }], error: { message: text } });
-    }
-  };
-  for (let index = 1; index <= 3; index += 1) {
-    assert.equal((await call()).kind, 'allow');
-    await emit('exit code 7');
-  }
-  const blocked = await call();
-  assert.equal(blocked.kind, 'deny');
-  assert.equal(blocked.info.code, 'REPEATED_IDENTICAL_FAILURE');
-  assert.match(blocked.reason, /请换一个可检验的新策略/);
-});
-
-// ── R11 ────────────────────────────────────────────────────────────────────
-
-const PARITY = [
-  { rule: 'C1 发散：先重述问题，再列 2–3 个方向并记入方向工具', words: ['重述问题', '真正的目标', '2–3 个', '反直觉', '简单问答或单步小改可跳过', '_directions'] },
-  { rule: 'C3 断点：save/read/clear 时机与工具不可用兜底', words: ['断点', 'clear', '工具不可用', '先核对断点'] },
-  { rule: 'C4 交付：静态检查与运行验证分开，不编造风险', words: ['静态检查与运行验证分开写', '不编造', '未验证'] },
-  { rule: '防循环：事前自检 + 运行时 loop-guard 计数 + 止损', words: ['事前自检', 'loop-guard', '止损'] },
-];
-
-test('R11 proof 与 deliberate 的 C1/C3/C4/防循环 语义逐条一致', () => {
-  const personas = {
-    proof: extractPersona(SOURCES.proof.patch),
-    deliberate: extractPersona(SOURCES.deliberate.patch),
-  };
-  const text = mode => personas[mode].prefix + '\n' + personas[mode].suffix;
-  const missing = [];
-  for (const group of PARITY) {
-    for (const mode of ['proof', 'deliberate']) {
-      const absent = group.words.filter(word => !text(mode).includes(word));
-      if (absent.length > 0) missing.push(`${mode} / ${group.rule} 缺：${absent.join('、')}`);
-    }
-  }
-  assert.deepEqual(missing, [], missing.join('\n'));
-});
-
-test('R11 每个 preset 只引用自己的工具名，不串台', () => {
-  const proofText = extractPersona(SOURCES.proof.patch);
-  const deliberateText = extractPersona(SOURCES.deliberate.patch);
-  assert.match(proofText.prefix + proofText.suffix, /proof_directions/);
-  assert.doesNotMatch(proofText.prefix + proofText.suffix, /deliberate_directions/);
-  assert.match(deliberateText.prefix + deliberateText.suffix, /deliberate_directions/);
-  assert.doesNotMatch(deliberateText.prefix + deliberateText.suffix, /proof_directions/);
-});
-
-test('R11 两个 preset 的防循环规则不互相矛盾：都靠 hook 计数，都保留 3 次换路', () => {
-  for (const mode of ['proof', 'deliberate']) {
-    const persona = extractPersona(SOURCES[mode].patch);
-    const text = persona.prefix + '\n' + persona.suffix;
-    // 都声明“不靠你自己计数”，避免模型和 hook 各数一套
-    assert.match(text, /不靠你自己计数/, `${mode} 缺少“不靠你自己计数”`);
-    // 都保留“三次/三轮”的止损锚点
-    assert.match(text, /(连续三轮|连续失败 3 次|失败三次)/, `${mode} 缺少止损锚点`);
-  }
+test('两个 preset 只引用自己的工具名', () => {
+  const text = personaText();
+  const mine = pkg.name === '@local/dsh-proof-preset' ? 'proof' : 'deliberate';
+  const other = mine === 'proof' ? 'deliberate' : 'proof';
+  assert.match(text, new RegExp(mine + '_hypotheses'));
+  assert.doesNotMatch(text, new RegExp(other + '_hypotheses'));
 });

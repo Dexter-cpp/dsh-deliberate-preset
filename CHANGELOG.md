@@ -1,5 +1,22 @@
 # 更新记录
 
+## 1.4.0
+
+与 `@local/dsh-proof-preset` 同版本。运行时行为、断点格式、评测与文档同步升级。
+
+- **成功调用不再被硬拦**：只有「同工具 + 同参数 + 同**失败**结果」连续 N 次才拒绝；成功调用最多得到软提示。修复 1.3.1 把正常重复读取判成空转的缺陷。
+- **签名/输出哈希全量计算**（`sig/v2` / `out/v2`），删除 8 KB 前缀截断；非文本输出、BigInt、循环引用、抛错访问器都有确定性处理。
+- **输出 streak 按工具隔离**；失败结果不再重复报「相同输出」。
+- **停滞自检状态触发**：连续 N 轮无新证据才注入；`selfCheckEvery` 保留为兼容项，默认 0。
+- **新增 `deliberate_hypotheses` 与 `deliberate_guard_stats`**（注册在 `loop-guard.cjs` 内，不新增插件行）；`deliberate_directions` 参数与文案保持兼容并镜像进账本。
+- **断点 v2**：taskId / goalRef / 结构化 state（goal、excluded、decisions、runs、counterexamples）；v1 可读并迁移，`writeSchema: 1` 可回滚。
+- **注入按事件触发**（resume / compaction / goal-change / milestone）；投影 fold 阶段脱敏。
+- **宿主能力逐项降级**：`sessionProjections` / `zod` / `defineTool` / `createUserMessage` 缺失时只降级对应功能。
+- **评测器**：环境元数据改为实采（DSH 版本、OS、Node、模型、权限、两仓 SHA），删除硬编码的「DSH 0.2.2-rc.5；Windows；deepseek-flash」；新增 `--no-unit`，默认先跑 `node --test` 并把单测结果单独写进报告；局部重跑的行会标注「沿用上次结果」。
+- **测试可独立运行**：新增 `state-bus.cjs` / `ledger.cjs` / `runtime-parity.json` / `sync-runtime.cjs`；`parity.test.cjs` 改用哈希清单，不再依赖相邻仓库目录。
+- **工具组合**：deliberate 原始 22 项保持不变，新增项仍是 `loop-guard` 与 `session-memory`。
+- 未实施（不写成已完成）：独立反方子代理、三臂对照评测、proof 行为评测、消融实验——见 `MIGRATION.md` 的「未实施项」。
+
 ## 1.3.1
 
 第四轮审查（F1–F3）：只修评测器与文档，运行时（`loop-guard.cjs` / `memory.cjs`）未改。
