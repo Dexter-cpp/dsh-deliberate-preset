@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-deliberate-preset",
-  "version": "1.4.1",
+  "version": "1.4.5",
   "private": true,
   "description": "DeepSeek Harness 权衡模式：先评估代价，再分块执行；假设账本 + 状态触发的止损，另带 19 个行为用例评测。",
   "type": "module",

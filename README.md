@@ -1,6 +1,6 @@
 # 权衡 · DSH 本地版
 
-版本 1.4.1。适用于方案选择、实施与排障。
+版本 1.4.5。适用于方案选择、实施与排障。
 
 工具组合：原始 22 项（不含 `session-memory`）保持不变，另新增 `loop-guard` 与 `session-memory`（后者承载 `deliberate_checkpoint` 断点）；`deliberate_hypotheses` 与 `deliberate_guard_stats` 注册在 `loop-guard` 内，不新增插件行。
 
@@ -10,8 +10,9 @@
 
 1. **连续相同失败**：同一工具 + 同一参数签名 + 同一**失败**结果连续 N 次（默认 3）后，第 N+1 次在 `tools/pre-execute` 被拒绝，错误码 `REPEATED_IDENTICAL_FAILURE`。拒绝理由本身带换路指令，同一步还会用 `createUserMessage` 注入一条「请换一个可检验的新策略，并先说明新假设与判定标准」。
 2. **成功调用永不硬拦**：重复读取、重复查询最多得到一条软提示；1.3.1 把成功重复判成失败的问题已修复。
-3. **连续相同输出**：参数不同但**同一工具**输出连续 N 次相同，只注入提示，不硬拒绝；streak 按工具隔离，非文本输出也参与比较。
-4. **停滞检查**：连续 N 轮没有新证据（`deliberate_hypotheses` 状态变化、断点保存都算新证据）才注入一次「写出当前假设与下一个区分性观察」。
+3. **连续相同输出**：**同一工具**输出连续 N 次相同，只注入提示，不硬拒绝；streak 按工具隔离，非文本输出也参与比较。
+4. **停滞检查**：同一用户轮内，连续 N 个有工具结果的步骤只得到重复观察，才触发检查。记录新的有效证据或在断点增加运行结果、反例、已排除项，可解除停滞计数。
+5. **交替失败**：A 和 B 是两个不同的工具调用或参数组合。两者按相同顺序各自复现相同失败 N 个周期（默认 3）后，再试预期的下一调用会收到 `REPEATED_FAILURE_CYCLE`。不同调用仍可执行。成功、切换目标或开始新的用户轮会打断旧失败链。
 
 连续两次撞上同一拦截会结束本轮；同一轮只拒绝一次，不会无限拒绝。`*_checkpoint`、`*_directions`、`*_hypotheses`、`*_guard_stats`、`todo_write` 等记账工具不参与计数。
 
@@ -27,7 +28,7 @@ hook 自身不会把会话搞崩：所有监听器内部 `try/catch`，任何异
 | `loop-guard.config.denyOn` | `failure` | 只有失败重复才硬拦；`never` = 只提示 | 同上 |
 | `loop-guard.config.threshold` | `3` | 连续相同失败 N 次后拦第 N+1 次；2..10，超出夹取 | 同上 |
 | `loop-guard.config.outputStreakThreshold` | `3` | 同工具连续相同输出 N 次 → 软提示；2..10 | 同上 |
-| `loop-guard.config.stallRounds` | `3` | 连续 N 轮无新证据 → 停滞检查；2..10 | 同上 |
+| `loop-guard.config.stallRounds` | `3` | 连续 N 个工具步骤只得到重复观察 → 停滞检查；2..10 | 同上 |
 | `loop-guard.config.selfCheckEvery` | `0` | 1.3.1 兼容项；`>0` 才按用户轮次自检 | 同上 |
 | `loop-guard.config.maxNoticesPerTurn` | `2` | 每轮最多注入条数；1..3 | 同上 |
 | `loop-guard.config.stats` | `memory` | `off` / `memory`（只在内存计数） | 同上 |
@@ -36,7 +37,7 @@ hook 自身不会把会话搞崩：所有监听器内部 `try/catch`，任何异
 | `session-memory.config.injectOn` | 四项全开 | resume / compaction / goal-change / milestone | 同上 |
 | `session-memory.config.maxInjectChars` | `800` | 单次注入上限；200..2000 | 同上 |
 
-`threshold` 数「连续相同失败次数」，`stallRounds` 数「连续无新证据轮次」，`outputStreakThreshold` 数「同工具相同输出次数」，三者不共用计数器。非法值不会静默生效：整数越界会夹取，类型/枚举不对会回退默认并告警。想看实际生效值，跑 `dsh --profile headless --patch ./cordis.patch.yml --dump-config`。
+`threshold` 控制连续相同失败次数与 A/B 周期数，`stallRounds` 数「同一用户轮内连续重复观察的步骤数」，`outputStreakThreshold` 数「同工具相同输出次数」，三者不共用计数器。非法值不会静默生效：整数越界会夹取，类型/枚举不对会回退默认并告警。想看实际生效值，跑 `dsh --profile headless --patch ./cordis.patch.yml --dump-config`。
 
 ## 假设账本
 
@@ -99,7 +100,7 @@ Remove-Item "$env:DSH_HOME\checkpoints\<profile>\*.corrupt-*.json"
 
 `EVALUATION.md` 的 19 个用例由 `evaluate.cjs` 跑两层：
 
-1. **静态断言**（可自动判定，57 条）：两个 `cordis.patch.yml` 可解析、两个 `package.json` 合法、preset ID 仍为 `proof`/`deliberate`、**工具组合按 preset 分列**（proof 原始 23 项 / deliberate 原始 22 项必须完整且顺序不变，新增项单列报告、不算失败）、两个 preset 都注册了 `loop-guard`、签名无 8 KB 截断、只拦失败重复、streak 按工具、假设账本与统计工具已注册、断点 v2 + v1 迁移 + fold 脱敏、注入策略、`runtime-parity.json` 哈希一致、README 无过时表述、版本号与 CHANGELOG 对应。
+1. **静态断言**（可自动判定，59 条）：两个 `cordis.patch.yml` 可解析、两个 `package.json` 合法、preset ID 仍为 `proof`/`deliberate`、**工具组合按 preset 分列**（proof 原始 23 项 / deliberate 原始 22 项必须完整且顺序不变，新增项单列报告、不算失败）、两个 preset 都注册了 `loop-guard`、签名无 8 KB 截断、只拦失败重复、streak 按工具、假设账本与统计工具已注册、断点 v2 + v1 迁移 + fold 脱敏、注入策略、`runtime-parity.json` 哈希一致、README 无过时表述、版本号与 CHANGELOG 对应。
 2. **模型行为采集**（脚本喂 DSH、收输出）：只做能确定性核验的判定（文件是否改对、命令是否通过、是否出现 `REPEATED_IDENTICAL_FAILURE`、是否出现与要求相悖的措辞等），其余才写「待人工复测」。状态列是三态：**自动通过 / 自动失败 / 待人工复测**；脚本判定不等于真实通过。
 
 单元测试不需要 dsh，也不需要额度，默认在静态断言之后、行为用例之前跑；失败会直接阻塞（`--no-unit` 可跳过）。静态断言与单测、行为评测**分开报告**，任何一类都不冒充另一类。
@@ -107,7 +108,7 @@ Remove-Item "$env:DSH_HOME\checkpoints\<profile>\*.corrupt-*.json"
 静态断言本身是关键词匹配，措辞一改就可能误判，所以 `--self-test` 会拿一组**故意改坏的副本**跑同一套断言（当前 15 条），确认它们真的会判失败——包括「把 8 KB 截断塞回签名」「去掉失败门控」「断点退回只认 v1」「把假设账本挪出 loop-guard」。
 
 ```powershell
-node --test                          # 单元测试：58 条（守卫 33 + 断点 13 + parity 12）
+node --test                          # 单元测试：守卫、断点与共享文件一致性
 node sync-runtime.cjs --check        # 共享文件哈希一致性
 node evaluate.cjs --static           # 只跑静态断言 + 单测，不调用模型
 node evaluate.cjs --self-test        # 静态断言的负向自检（不需要 dsh）
@@ -127,6 +128,14 @@ proof 目录默认是并排的 `../dsh-proof-preset`，也可以用环境变量 
 评测会真实消耗模型额度；原始会话记录保存在 `.eval/`（已 gitignore）。
 
 **未实施**：standard / 1.3.1 / 候选三臂对照、每用例 ≥3 次重复、消融实验、proof 独立行为评测——这些在 `MIGRATION.md` 的「未实施项」里列明，不写成已完成。
+
+## 离线安装
+
+```powershell
+dsh plugin --profile desktop add file:C:/path/to/local-dsh-deliberate-preset-1.4.5.tgz
+```
+
+把路径换成实际文件位置。在对应 profile 的插件管理器启用 `@local/dsh-deliberate-preset`。
 
 ## 使用
 

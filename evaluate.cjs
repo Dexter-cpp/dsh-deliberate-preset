@@ -265,7 +265,7 @@ async function readDshVersion(dshPath) {
 
 /** 跑单元测试（不需要 dsh、不消耗额度）；失败即视为发布阻塞。 */
 function runUnitTests() {
-  const result = run(PRESET_DIR, process.execPath, ['--test'], 300000);
+  const result = run(PRESET_DIR, process.execPath, ['--test', '--test-reporter=tap'], 300000);
   const text = String(result.output ?? '') + '\n' + String(result.error ?? '');
   const pass = /# pass (\d+)/.exec(text);
   const fail = /# fail (\d+)/.exec(text);
@@ -592,7 +592,7 @@ function runChecks(sources, proofDir = DEFAULT_PROOF_DIR) {
     guardText.includes('state.failed') && guardText.includes('denyOn') && guardText.includes('repeatFailure'),
     'denyOn=failure + 失败链判断');
   check('输出 streak 按工具隔离且覆盖非文本输出',
-    guardText.includes('state.streaks.get(exec.name)') && guardText.includes("type === 'image'") &&
+    guardText.includes('state.streaks.get(exec.name)') && guardText.includes('blocksOf(result), result?.structuredContent') &&
     guardText.includes('function hasOutput'),
     '同工具才累计；图片/资源参与哈希');
 
@@ -907,8 +907,7 @@ function writeOverlays(hostManifest) {
     '      name: ../loop-guard.cjs',
     '      config:',
     '        threshold: 3',
-    '        # 0 不是合法值（会回退默认 3 并告警）；单轮用例本来也到不了第 3 轮。',
-    '        selfCheckEvery: 3',
+    '        selfCheckEvery: 0',
     `        hostManifest: ${JSON.stringify(hostManifest)}`,
     '    - id: eval-session-memory',
     '      name: ../memory.cjs',
