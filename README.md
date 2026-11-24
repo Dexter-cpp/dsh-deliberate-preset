@@ -1,186 +1,106 @@
-# 权衡 · Deliberate
+# 权衡 · DSH 本地版
 
-**先判断值不值得做，再把对的事情做完。**
+版本 1.3.0。适用于方案选择、实施与排障。
 
-DeepSeek Harness（DSH）的社区模式插件，与标准、创造等模式一样，通过 Agent preset 选择使用。它让复杂任务先比较路径、估算代价，再分块执行、检查进展，并在反复失败时换路或止损。
+## 防循环（运行时硬拦截）
 
-纯配置 bundle：不新增 JavaScript 实现，不需要构建，不增加模型服务或第三方 API。它改变的是工作方式，实际工具和执行能力仍由 Harness 提供。非 DeepSeek 官方插件。
+`loop-guard.cjs` 是运行时 hook，规则用可计算度量（SHA256），不做语义相似：
 
-当前版本为 **1.1.0-beta.2**。同一轮排查可以包含读文件、改动和检查。提交超时时先核对目标状态，避免重复提交。用户接受方案代价后可以继续执行，有争议的事实仍需查证。
+1. **连续相同调用**：同一工具 + 同一参数签名（`signature()`）+ 同一输出 hash 连续 N 次（默认 3）后，第 N+1 次在 `tools/pre-execute` 被拒绝，错误码沿用 `REPEATED_IDENTICAL_FAILURE`。拒绝理由本身带换路指令，同一步还会用 `createUserMessage` 注入一条「当前做法已连续 N 次相同，请换一个可检验的新策略，并先说明新假设与判定标准」——不是只回一个拒绝码。
+2. **连续相同输出**：参数不同但连续 N 次输出 hash 相同，只注入提示，不硬拒绝（合法的重复检查不该被拦）。
+3. **轮次自检**：每 `selfCheckEvery` 个用户轮次注入一次「当前做法是否在重复之前失败过的路径」。
 
-## 为什么用权衡
+连续两次撞上同一拦截会结束本轮；同一轮只拒绝一次，不会无限拒绝。`*_checkpoint`、`*_directions`、`todo_write` 等记账工具不参与计数。
 
-| 机制 | 希望改善的问题 | 使用收益 |
-| --- | --- | --- |
-| 按任务规模评估目标、代价和路径 | 目标没弄清就开工 | 在投入前看清范围、成本和替代方案 |
-| 显式标记假设 | 把猜测当成事实 | 更容易发现和纠正错误前提 |
-| 核对目标和版本 | 把旧版的测试结果算到新版上 | 反驳和验收都能指向同一次运行 |
-| 施工图：依赖、产出、验收、状态 | 长任务做到哪算哪 | 每一块都有可以检查的完成标准 |
-| 阶段闸门 | 成本持续增加却继续硬推 | 在阶段之间重新评估收益和成本 |
-| 三次法则、原点检测、收敛判断 | 同一种失败反复重试，错误从 A 移到 B | 促使模型换策略、拆小问题或重新定义目标 |
-| 收工自证 | 只说“完成了” | 分清验证过、未验证，以及具体失效场景 |
-| 简短决策日志 | 看不出为什么选这条路 | 保留选择与取舍的可检查摘要 |
-| 简单任务直接处理 | 为小事套大流程 | 知识问答、错别字、格式和单步任务直接处理 |
+hook 自身不会把会话搞崩：所有监听器内部 `try/catch`，任何异常都降级为「放行 + 往 stderr 记一条日志」；参数签名与输出 hash 只取前 8 KB，超大输出不会拖死会话。
 
-作者已确认原版 `1.0.0` 通过空转、歧义和反驳三项行为测试；新版待复测（详见下方测试状态）。这些机制的收益尚未在本仓库提供对照实验或量化性能数据。它可能降低无效重试，也可能因为规划与检查增加耗时和 token；不承诺更快、更便宜或必然正确。
+## 配置
 
-## 1.1 优化了什么
+两个计数器**完全独立**，各有各的配置项，改一个不影响另一个：
 
-- **流程按需触发：** 简单任务直接做，普通任务简述后执行，复杂任务才比较路线、分阶段验收；不再强凑第二条方案。
-- **歧义分流：** 先查证，关键且无法查清的问题再问；低影响、可撤销的细节可标假设继续。已有完整方案也不能豁免关键歧义。
-- **反驳后能落实：** 有证据地指出目标与手段冲突；用户明确接受取舍后继续已授权工作，出现新事实再提醒。
-- **防循环更精确：** 区分有新证据的反复修改与无进展重试；三次规则保留，换阶段名或小改参数不能掩盖空转。
-- **减少重复汇报：** 关键检查与进展合并，计划工具与表格择一；不要求每块固定追加三行日志。
-- **验证如实表述：** 区分静态检查与运行验证，不为凑模板编造剩余风险。
+| 配置项 | 默认 | 含义 | 怎么改 |
+|---|---|---|---|
+| `loop-guard.config.threshold` | `3` | B1：同一工具 + 同一参数 + 同一输出连续 N 次后拦截第 N+1 次 | 改 `cordis.patch.yml` 里 `loop-guard` 行的 `threshold`。必须正整数；`0`、负数、非数字、小数都会回退默认 `3`，并在 stderr 打一条 `[loop-guard] 配置 ... 不是正整数` 告警 |
+| `loop-guard.config.selfCheckEvery` | `3` | C2：每 N 个用户轮次注入一次事前自检 | 同上，改 `selfCheckEvery`。同样必须正整数，非法值回退 `3` |
 
-以上是规则修改及设计目的，尚未量化证明耗时、token 或成功率的改善。
+`threshold` 数的是「连续相同调用次数」，`selfCheckEvery` 数的是「用户轮次」，两者不共用计数器：把 `threshold` 调到 10 不会让自检失效，把 `selfCheckEvery` 调到 99 也不会让拦截失效。想看实际生效值，跑 `dsh --profile headless --patch ./cordis.patch.yml --dump-config`。
 
-## 适合什么任务
+## 方向记录
 
-- 多文件改动、重构、迁移，以及有多种方案的实现任务。
-- 难复现的故障排查，尤其是已经反复修复但没有收敛的问题。
-- 需要先核算成本、风险、边界条件的技术方案。
+`deliberate_directions` 在会话内保存本轮列出的 2–3 个方向（各一句 + 一句利弊），最多 3 条、每条 200 字符，**不落盘**。卡住或准备换路时，防循环提示会把这份记录带出来，先看有没有漏掉但能用的方向，再决定是否重想。简单问答可以不用。
 
-简单问答和小改动也能使用，提示词已设定直接处理的豁免。需要快速大量发散想法时，可根据任务选择其他模式；权衡的侧重点是取舍与收敛。
-
-## 安装
-
-### 1. 下载到固定目录
-
-已安装 Git 时：
-
-```sh
-git clone https://github.com/Dexter-cpp/dsh-deliberate-preset.git
+```
+deliberate_directions { action: "set", items: ["方向 A（利/弊）", "方向 B（利/弊）"] }
+deliberate_directions { action: "read" }
+deliberate_directions { action: "clear" }
 ```
 
-也可以使用 GitHub 的 **Code → Download ZIP**，解压到长期保留的位置。安装目标是包含 `package.json` 和 `cordis.patch.yml` 的文件夹，不是 ZIP 文件。
+## 断点生命周期
 
-### 2. 在 Harness 中安装 bundle
+一句话：**断点存在 `<DSH_HOME>/checkpoints/<profile>/` 下的会话级 JSON 文件；同一会话重启后仍能读回，新建会话或 `clear` 后失效。**
 
-在能够使用插件管理工具的 Harness 会话中发送，例如：
-
-```text
-请用 plugin_manager 安装本地模式插件，action 为 install_bundle，
-target 为 C:/DSH-plugins/dsh-deliberate-preset。
-安装后检查该 bundle 已启用。
-```
-
-将示例路径替换成自己的**绝对路径**。对应的工具参数如下；这是 Harness 工具调用参数，不是终端命令：
+`deliberate_checkpoint` 支持 save、read、clear，最多 800 字符。save 写文件；read 文件优先，`ctx.sessionProjections` 的内存投影兜底。schema 固定为：
 
 ```json
-{
-  "action": "install_bundle",
-  "target": "C:/DSH-plugins/dsh-deliberate-preset"
-}
+{"schemaVersion":1,"sessionId":"session-…","profile":"desktop","note":"断点正文（≤800 字符）","updatedAt":"2026-11-24T03:00:00.000Z"}
 ```
 
-安装只作用于当前 profile。本地目录安装可能通过链接引用原目录，安装后请保留目录，避免移动或删除。原始说明提示安装可能影响其他 bundle 的启用状态，安装后应检查插件页；这不是本插件单独修改其他插件的逻辑。
+| 问题 | 结论 |
+|---|---|
+| 存在哪 | `<DSH_HOME>/checkpoints/<profile>/<sha256(sessionId) 前 32 位>.json`；哈希文件名避免特殊字符造成路径问题 |
+| 什么时候失效 | 新建会话（新 session id）读不到；切换 preset 同理；`clear` 删除文件；删除会话后文件成为孤儿，不再被任何会话引用，可手动清理 |
+| 切换模型 | 不失效：文件与模型选择无关 |
+| 上下文压缩 | 不失效：文件在，投影仍能从会话事件重建 |
+| 是否按项目目录共享 | 不共享：按会话隔离 |
+| 并发写 | 一个会话只有一个写者；临时文件 + 原子 rename，最后写入者生效 |
+| 多 profile | 路径含 profile 名，互不覆盖 |
+| 和 sessionProjections 的关系 | 并存，不是替换：文件是持久层，投影负责本会话内的即时提示与兜底 |
 
-使用 Web 版且终端已配置 `dsh` 命令时，也可以直接把解压目录链接到 Web profile。把引号内的路径替换为本机的实际目录。
+### 敏感字段与损坏文件
 
-```sh
-dsh plugin --profile web add "link:C:/DSH-plugins/dsh-deliberate-preset"
+- **落盘前过滤**：`api_key` / `token` / `password` / `Authorization` / `sk-…` / `ghp_…` / `AKIA…` / JWT / 私钥块等形态的字段会被替换成 `[已过滤]`，工具会告诉你「疑似密钥字段已过滤」。宁可多过滤，也不要把凭据留在明文 JSON 里。
+- **文件损坏**：JSON 解析失败或 `schemaVersion` 不符时，文件被重命名为 `<hash>.json.corrupt-<时间戳>.json`，按空断点重建，不会让会话崩掉；stderr 会有 `[checkpoint] 断点文件损坏` 告警。
+
+### 手动清理（`clear` 之外）
+
+```powershell
+# 删掉某个 profile 的全部断点
+Remove-Item "$env:DSH_HOME\checkpoints\<profile>" -Recurse -Force
+# 只删某个会话的断点（文件名是 sessionId 的 sha256 前 32 位）
+Remove-Item "$env:DSH_HOME\checkpoints\<profile>\<hash>.json"
+# 隔离出来的损坏文件可以随时删
+Remove-Item "$env:DSH_HOME\checkpoints\<profile>\*.corrupt-*.json"
 ```
 
-### 3. 选择“权衡”
+`$env:DSH_HOME` 未设置时默认是 `~/.dsh`。
 
-在模式选择器中选择 **权衡**，建议新建会话验证。预设 ID 是 `deliberate`，排序值为 `5`；最终显示顺序取决于已安装的其他模式。若尚未出现，检查插件是否启用、当前 profile 是否正确，并在需要时重启 Harness。
+## 自动化评测
 
-无需单独运行 `npm install` 或构建命令。`private: true` 防止误发 npm，不影响作为本地 bundle 使用；本仓库发布不代表已进入 npm 或官方插件市场。
+`EVALUATION.md` 的 19 个用例由 `evaluate.cjs` 跑两层：
 
-## 怎么用
+1. **静态断言**（可自动判定）：两个 `cordis.patch.yml` 可解析、两个 `package.json` 合法、preset ID 仍为 `proof`/`deliberate`、工具组合行未变、两个 preset 都注册了 `loop-guard`、proof 的 `memory.cjs` 无旧守卫、B1/C2 计数器独立、hook 异常降级、配置校验、断点过滤与容错、C1/C3/C4 语义一致、README 无过时表述、版本号与 CHANGELOG 对应。
+2. **模型行为采集**（脚本喂 DSH、收输出）：只做能确定性核验的判定（文件是否改对、命令是否通过、是否出现 `REPEATED_IDENTICAL_FAILURE`、是否出现与要求相悖的措辞等），其余才写「待人工复测」。状态列是三态：**自动通过 / 自动失败 / 待人工复测**；脚本判定不等于真实通过。
 
-安装并选择模式后，正常描述任务即可，无需每次复制整份提示词。
+静态断言本身是关键词匹配，措辞一改就可能误判，所以 `--self-test` 会拿一组**故意改坏的副本**跑同一套断言，确认它们真的会判失败——断言不会“怎么改都通过”。
 
-**重构前比较方案：**
-
-```text
-这个模块需要支持两种数据源。先评估最小改动与抽象接口两种路线的成本，
-推荐一种；需要改多个文件时列出依赖、产出和验收，再实施。
+```powershell
+node evaluate.cjs --static          # 只跑静态断言
+node evaluate.cjs --self-test       # 静态断言的负向自检（不需要 dsh）
+node evaluate.cjs                   # 静态断言 + 19 个行为用例
+node evaluate.cjs --only 1,8,15     # 只跑指定行为用例
+node evaluate.cjs --dry-run         # 只打印覆盖层和用例清单
 ```
 
-**让排障收敛：**
+退出码：`0` = 全部通过；`1` = 有断言/用例失败，或负向用例没被识别；`2` = 无法运行（参数错误、找不到 dsh）。
 
-```text
-这个测试偶发失败，前两次修改都没有解决。
-请先收集证据，明确假设；若同一种方法连续失败三次，换策略，
-最后说明实际验证了什么、还有什么没验证。
+评测会真实消耗模型额度；原始会话记录保存在 `.eval/`（已 gitignore）。
+
+单元测试不需要 dsh：
+
+```powershell
+node --test loop-guard.test.cjs memory.test.cjs parity.test.cjs
 ```
 
-**评估是否值得做：**
+## 使用
 
-```text
-我想为了一个每周运行一次的小脚本引入消息队列。
-请先评估收益、维护成本和更简单的替代方案，再给建议。
-```
-
-以上是使用示例，未作为真实模型输出或效果测试记录。复杂任务按需要使用：开场评估 → 分阶段执行与关键节点检查 → 收工验证；重大取舍才附简短决策摘要。具体输出由模型、任务和当前环境决定。
-
-## 禁用与卸载
-
-临时不用时，切换其他模式；要停用整个 bundle，在插件页禁用。
-
-卸载前先将使用该预设的会话切换到其他模式，再请 Harness 调用：
-
-```json
-{
-  "action": "remove_bundle",
-  "target": "@local/dsh-deliberate-preset"
-}
-```
-
-按工具返回提示完成必要的重启。确认卸载后再删除本地目录。
-
-## 实现与兼容性
-
-| 项目 | 值 |
-| --- | --- |
-| 包名 | `@local/dsh-deliberate-preset` |
-| 版本 | `1.1.0-beta.2` |
-| 预设声明行 ID | `preset-deliberate` |
-| 预设 ID / 显示名 | `deliberate` / 权衡 |
-| 顶层子插件项 | 23（含插件组，不等于 23 个叶子工具） |
-| 定义文件 | [`cordis.patch.yml`](cordis.patch.yml) |
-
-`package.json` 通过 `dsh.bundle.patch` 声明补丁；补丁插入一个 `@deepseek-ai/dsh-agent-preset`。`persona.prefix` 定义态度，`persona.suffix` 定义九节工作规则，未设置 `complete`。它没有显式覆盖沙箱或审批策略；实际权限仍取决于宿主配置。
-
-工具组合来自 Standard 的静态快照，包含平台 shell、文件、搜索、规划、压缩、委派、网页与办公等插件声明，部分插件按平台或环境禁用。**它不动态继承 Standard，也不会自动同步上游新增工具。** 2026-11-23 对照上游提交 `4b399c39a6d1479cd84ca591b4d7c88e24d38a96`：除 persona 外，当前上游还多一个 `tool-cordis`，其余子插件声明一致。
-
-插件需要宿主提供所声明的 DSH 插件及 Agent preset 服务。已在 Windows 的 Harness `0.2.2-rc.5` Web profile 中验证安装与加载，最低兼容版本待确认。
-
-## 测试状态
-
-作者于 2026-11-23 确认，原版 `1.0.0` 已通过以下三项行为测试：
-
-| 测试项 | 作者测试结果 |
-| --- | --- |
-| 空转测试 | 已通过 |
-| 歧义测试 | 已通过 |
-| 反驳测试 | 已通过 |
-
-以上结果由作者提供。测试题目、模型与 Harness 版本、判定标准及原始记录尚未收录到本仓库；发布整理过程未独立复测。结果描述的是作者测试场景下的表现，不代表所有模型和任务都能稳定通过，也不构成节省 token 或提高速度的量化结论。
-
-`1.1.0-beta.2` 已在新的 Web profile 中从解压目录安装。运行中的 Harness 注册表列出了“权衡”，成功取得其运行作用域，读回的两段提示词与发布文件一致。新版的模型回答仍待实测。[查看行为用例](EVALUATION.md)
-
-发布准备另已完成：JSON/YAML 静态解析、预设 ID 和 23 项顶层声明检查、README 本地链接检查，以及远程发布内容核对。
-
-## 局限与排障
-
-- **不是硬性执行器：** 三次止损、阶段闸门与验收均依赖模型遵守；没有运行时计数器或强制拦截。
-- **不能替代权限控制：** 提示词中的“有权说不”与“用户坚持”不构成系统权限，不能绕过审批、沙箱或安全约束。
-- **流程可能偏重：** 九节提示词会占用上下文，复杂任务可能输出较多；简单任务直接处理也依赖模型判断。
-- **新模式未出现：** 检查安装路径、bundle 启用状态、profile、预设 ID 冲突，并新建会话或重启。
-- **报缺少插件：** 检查 Harness 版本与所需插件是否齐全。不要用添加构建脚本解决纯配置 bundle 的宿主兼容问题。
-- **更新后行为未变：** 本地链接与 Git/归档安装的更新方式不同；按安装来源更新，并新建 Agent/会话验证。
-- **插件详情无独立图标或本地化名称：** 本版本未提供额外图标、locale 资源，界面可能回退到包名和 README。
-
-提交问题时请提供 Harness 版本、操作系统、安装方式和脱敏后的完整错误信息。
-
-## 上游与许可证
-
-- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
-- [Agent preset 定义](https://github.com/deepseek-ai/deepseek-harness/blob/4b399c39a6d1479cd84ca591b4d7c88e24d38a96/packages/preset/agent-preset/README.md)
-- [插件管理说明](https://github.com/deepseek-ai/deepseek-harness/blob/4b399c39a6d1479cd84ca591b4d7c88e24d38a96/packages/boot/plugin-manager/README.md)
-- [Standard 配置来源](https://github.com/deepseek-ai/deepseek-harness/blob/4b399c39a6d1479cd84ca591b4d7c88e24d38a96/packages/bundle/web-app/presets/standard.patch.yml)
-
-采用 [MIT License](LICENSE)。Standard 派生配置的上游版权声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+在模式选择器中选 权衡，新建会话即可使用。已打开的旧会话可能仍绑定旧版。

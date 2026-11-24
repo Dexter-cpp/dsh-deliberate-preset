@@ -1,5 +1,34 @@
 # 更新记录
 
+## 1.3.0
+
+第二轮 / 第三轮审查（R1–R12）的收尾版本。
+
+- **R1 双 preset 防循环**：`loop-guard.cjs` 现在两个 preset 各带一份完全相同的实现（`proof-preset/loop-guard.cjs` 新增），两个 `cordis.patch.yml` 都注册了 `- id: loop-guard`，且排在 `session-memory` 之前。proof 的 `memory.cjs` 删除旧 `ctx.tools.guard` 与 `REPEATED_IDENTICAL_FAILURE` 计数，只留断点。
+- **R2 拦截后注入换路指令**：拒绝理由改为「当前做法已连续 N 次相同，请换一个可检验的新策略，并先说明新假设与判定标准」，同一步再用 `createUserMessage` 注入一条 user 消息；不再只返回拒绝码。
+- **R3 计数器分离**：B1（连续相同调用次数，`threshold`）与 C2（用户轮次，`selfCheckEvery`）用互不相干的状态字段，结构性检查确认两段代码不读对方的计数器。
+- **R4 deliberate 的 `memory.cjs` 去留**：确认它不是僵尸文件——只保留 `deliberate_checkpoint` 的 save/read/clear 与落盘容错，不再有防循环逻辑；两份 `memory.cjs` 逐字节一致。
+- **R5 用例判据自动化**：用例 6/9/11/13/17 从「待人工复测」改为确定性判据（含负向判据）；只剩用例 1、2 需要人工，理由写进 `EVALUATION.md` 与代码注释。
+- **R6 hook 自身不崩**：所有监听器 `try/catch`，异常降级为「放行 + stderr 日志」；参数签名与输出 hash 只取前 8 KB（`MAX_HASH_CHARS`），超大输出不参与拼接。
+- **R7 配置可校验 + 有文档**：`threshold` / `selfCheckEvery` 必须是正整数，`0` / 负数 / 非数字 / 小数回退默认 `3` 并在 stderr 告警；两个 README 增加配置表（名字、默认值、含义、怎么改）。
+- **R8 方向留痕**：新增 `deliberate_directions`（会话内、不落盘、最多 3 条），卡住或换路时防循环提示会引用已记录方向，先回看再决定是否重想。
+- **R9 断点落盘安全**：写入前过滤密钥/token/密码类字段；JSON 损坏或 schema 不符时隔离为 `.corrupt-<时间戳>.json` 并按空断点重建；README 补 `clear` 之外的手动清理方式。
+- **R10 静态断言防脆弱**：`evaluate.cjs --self-test` 用 9 条故意改坏的副本验证断言会判失败；退出码约定 `0` 全过 / `1` 有失败 / `2` 无法运行。
+- **R11 两个 preset 一致**：C1/C3/C4 与防循环段逐条对齐（proof 补「静态检查与运行验证分开写」「不编造」与 `loop-guard` 计数说明），并新增 `parity.test.cjs` 守着。
+- **R12 版本与文档**：两个 `package.json` 升到 `1.3.0`；proof 新增 `CHANGELOG.md`；README 清掉「同错复现守卫」「纯配置」等过时表述。
+- 新增单测：`loop-guard.test.cjs`（21 条）、`memory.test.cjs`（11 条）、`parity.test.cjs`（8 条），均不需要 DSH。
+
+## 1.2.0-beta.2
+
+- 防循环从纯提示词升级为运行时硬拦截：新增 `loop-guard.cjs`，承接 `memory.cjs` 原有的三次守卫（同工具 + 同参数 + 同错误，`REPEATED_IDENTICAL_FAILURE`），N 可配置（默认 3），并补充输出 hash 与每 N 个用户轮次的事前自检注入。`memory.cjs` 只保留断点，删除重复守卫，避免两份计数器。
+- 新增 `evaluate.cjs`：先跑静态断言（两个 YAML/JSON 可解析、preset ID 未变、原始 23 行工具组合未变、persona 关键词、hook/断点落盘），再批量跑 19 个行为用例；状态按「自动通过 / 自动失败 / 待人工复测」三态回填，明确「脚本判定≠真实通过」。
+- 断点改为落盘：`<DSH_HOME>/checkpoints/<profile>/<hash>.json`，schema 固定；临时文件 + 原子 rename，一个会话单写者；多 profile 分目录；与 `sessionProjections` 并存（文件持久层 + 投影即时提示）。
+- 代价估算加入三个量化维度：改动文件数、预计轮次、是否不可逆。
+- 施工图每块必须写可检验的通过条件，并与 `EVALUATION.md` 判据对齐。
+- 两个 preset 的 prefix 增加问题重述与「先列 2–3 个方向，其中至少一个反直觉/逆向/极端」；suffix 增加「不强制套固定结构」。
+- 防循环段加入事前自检；deliberate 由 hook 每 N 个用户轮次真正计数并注入，proof 使用阶段/卡住等自然锚点。
+- 保持预设 ID 与原始 23 行工具组合不变。
+
 ## 1.1.0-beta.2
 
 - 明确失败尝试的计数单位，并在提交超时时先核对是否生效。

@@ -1,8 +1,8 @@
 {
   "name": "@local/dsh-deliberate-preset",
-  "version": "1.1.0-beta.2",
+  "version": "1.3.0",
   "private": true,
-  "description": "DeepSeek Harness 权衡模式：先评估代价，再分块执行，以阶段检查、显式假设和防循环规则促进任务收敛。",
+  "description": "DeepSeek Harness 权衡模式：先评估代价，再分块执行；带运行时防循环硬拦截，并可自动跑 19 个行为用例。",
   "type": "module",
   "dsh": {
     "bundle": {
@@ -31,6 +31,13 @@
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
     "CHANGELOG.md",
-    "EVALUATION.md"
+    "EVALUATION.md",
+    "memory.cjs",
+    "loop-guard.cjs",
+    "loop-guard.test.cjs",
+    "memory.test.cjs",
+    "parity.test.cjs",
+    "evaluate.cjs",
+    "evaluate-answerer.cjs"
   ]
 }
