@@ -6,7 +6,8 @@
  *
  * 两层，互不冒充：
  * 1. 静态断言（可自动判定）：两个 preset 的 YAML/JSON 可解析、preset ID 未变、
- *    原始 23 行工具组合未变、persona 关键词与 hook/断点实现齐全、两个 preset 都挂了
+ *    工具组合按 preset 分列校验（proof 原始 23 项 / deliberate 原始 22 项必须完整且顺序不变，
+ *    新增项单列报告、不算失败）、persona 关键词与 hook/断点实现齐全、两个 preset 都挂了
  *    loop-guard、C1/C3/C4 语义一致、README 无过时表述。
  * 2. 模型行为（脚本只喂 DSH、收输出）：只有能确定性核验的项才给「自动通过/自动失败」
  *    （文件是否改对、命令是否通过、是否出现 REPEATED_IDENTICAL_FAILURE、是否出现
@@ -24,13 +25,18 @@
  *   node evaluate.cjs --jobs 3          # 并发数（默认 3）
  *   node evaluate.cjs --timeout-ms 300000
  *   node evaluate.cjs --dsh <path>      # 指定 dsh 命令
+ *   node evaluate.cjs --proof-dir <path>  # 指定 proof preset 目录（默认 ../proof-preset，也可用 DSH_PROOF_DIR）
  *   node evaluate.cjs --dry-run         # 只打印覆盖层和用例清单
  *   node evaluate.cjs --no-update       # 跑评测但不改 EVALUATION.md
+ *
+ * proof 目录不是硬编码的：仓库名是 dsh-proof-preset，目录可能与本仓库不并排，
+ * 用 --proof-dir 或 DSH_PROOF_DIR 指过去。读不到 `<proof-dir>/cordis.patch.yml`
+ * 时，脚本在静态断言开始前直接报错并以退出码 2 结束，不会拿空串去跑断言。
  *
  * 退出码（R10）：
  *   0 = 全部通过（静态断言全过；行为用例没有「自动失败」）
  *   1 = 有失败（断言失败、负向用例没被识别、或出现自动失败）
- *   2 = 无法运行（参数错误、找不到 dsh 等环境问题）
+ *   2 = 无法运行（参数错误、找不到 dsh、找不到 proof 目录等环境问题）
  */
 
 const fs = require('node:fs');
@@ -41,6 +47,12 @@ const PRESET_DIR = __dirname;
 const EVALUATION_PATH = path.join(PRESET_DIR, 'EVALUATION.md');
 const PATCH_PATH = path.join(PRESET_DIR, 'cordis.patch.yml');
 const EVAL_ROOT = path.join(PRESET_DIR, '.eval');
+/**
+ * proof preset 目录。默认与 deliberate 并排（../proof-preset），但仓库名是
+ * dsh-proof-preset、目录也可能叫别的，所以允许用 --proof-dir 或 DSH_PROOF_DIR 覆盖。
+ * 读不到 cordis.patch.yml 时在静态断言前直接报错退出，不把空串喂给断言。
+ */
+const DEFAULT_PROOF_DIR = path.join(PRESET_DIR, '..', 'proof-preset');
 const RUN_STAMP = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
 const RUN_ROOT = path.join(EVAL_ROOT, 'run-' + RUN_STAMP);
 const isWindows = process.platform === 'win32';
@@ -50,8 +62,16 @@ const AUTO_PASS = '自动通过';
 const AUTO_FAIL = '自动失败';
 const MANUAL = '待人工复测';
 
-/** 原始 23 行组合（persona 之外的全部顶层子插件）。loop-guard 是新增 hook，不算组合行。 */
-const GOLDEN_ROWS = [
+/**
+ * 工具组合基准（persona 之外的全部顶层子插件）。
+ *
+ * 两个 preset 的**起点不同**，不能共用一份清单：
+ * - proof 原始就是 23 项，其中包含 session-memory；
+ * - deliberate 原始只有 22 项，session-memory 是本次新增的（承载 deliberate_checkpoint）。
+ * 共用一份 23 项清单会把「deliberate 新增 session-memory」当成「本来就有、必须匹配」，
+ * 既掩盖了新增，也会在将来真的丢行时误报成「组合未变」。
+ */
+const PROOF_BASELINE_ROWS = [
   'session-memory',
   'agent-instructions',
   'time-context',
@@ -77,11 +97,28 @@ const GOLDEN_ROWS = [
   'tool-plugin-market',
 ];
 
+const DELIBERATE_BASELINE_ROWS = PROOF_BASELINE_ROWS.filter(row => row !== 'session-memory');
+
+/**
+ * 本次有意新增的行。单独报告、不计入原始组合，也不算失败；
+ * 缺失时只在报告里标注「未见」，由各自的专项断言（loop-guard 注册、断点落盘）负责兜底。
+ */
+const ADDED_ROWS = {
+  proof: ['loop-guard'],
+  deliberate: ['loop-guard', 'session-memory'],
+};
+
+const BASELINE_ROWS = {
+  proof: PROOF_BASELINE_ROWS,
+  deliberate: DELIBERATE_BASELINE_ROWS,
+};
+
 // ── 参数 ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
   const options = {
     dsh: undefined,
+    proofDir: undefined,
     only: undefined,
     jobs: 3,
     timeoutMs: 300000,
@@ -99,6 +136,8 @@ function parseArgs(argv) {
       return value;
     };
     if (argument === '--dsh') options.dsh = next();
+    else if (argument === '--proof-dir') options.proofDir = next();
+    else if (argument.startsWith('--proof-dir=')) options.proofDir = argument.slice('--proof-dir='.length);
     else if (argument === '--only') options.only = next().split(',').map(value => Number(value.trim())).filter(Number.isInteger);
     else if (argument === '--jobs') options.jobs = Math.max(1, Number(next()) || 1);
     else if (argument === '--timeout-ms') options.timeoutMs = Math.max(30000, Number(next()) || 300000);
@@ -314,11 +353,10 @@ function topLevelRows(patchText) {
 // ── 静态断言 ────────────────────────────────────────────────────────────────
 
 /** 把两个 preset 的所有文本读进内存；--self-test 改的是这些字符串，不碰磁盘。 */
-function collectSources(root = PRESET_DIR) {
+function collectSources(root = PRESET_DIR, proofDir = DEFAULT_PROOF_DIR) {
   const readText = (dir, file) => {
     try { return fs.readFileSync(path.join(dir, file), 'utf8'); } catch { return ''; }
   };
-  const proofDir = path.join(root, '..', 'proof-preset');
   return {
     proofPatch: readText(proofDir, 'cordis.patch.yml'),
     deliberatePatch: readText(root, 'cordis.patch.yml'),
@@ -336,21 +374,25 @@ function collectSources(root = PRESET_DIR) {
   };
 }
 
-/** 让断言代码按“相对路径”取到内存里的文本，而不是回读磁盘。 */
+/**
+ * 让断言代码按“逻辑键”取到内存里的文本，而不是回读磁盘。
+ * 本仓库文件用相对路径做键；proof 仓库的文件统一加 `proof:` 前缀——它们不是路径，
+ * 真实目录由 --proof-dir / DSH_PROOF_DIR 决定。
+ */
 function sourceOf(sources) {
   const map = {
     'cordis.patch.yml': sources.deliberatePatch,
-    '../proof-preset/cordis.patch.yml': sources.proofPatch,
+    'proof:cordis.patch.yml': sources.proofPatch,
     'memory.cjs': sources.deliberateMemory,
-    '../proof-preset/memory.cjs': sources.proofMemory,
+    'proof:memory.cjs': sources.proofMemory,
     'loop-guard.cjs': sources.deliberateGuard,
-    '../proof-preset/loop-guard.cjs': sources.proofGuard,
+    'proof:loop-guard.cjs': sources.proofGuard,
     'README.md': sources.deliberateReadme,
-    '../proof-preset/README.md': sources.proofReadme,
+    'proof:README.md': sources.proofReadme,
     'package.json': sources.deliberatePkgText,
-    '../proof-preset/package.json': sources.proofPkgText,
+    'proof:package.json': sources.proofPkgText,
     'CHANGELOG.md': sources.deliberateChangelog,
-    '../proof-preset/CHANGELOG.md': sources.proofChangelog,
+    'proof:CHANGELOG.md': sources.proofChangelog,
     'evaluate.cjs': sources.evaluator,
   };
   return file => {
@@ -385,13 +427,13 @@ function runChecks(sources) {
   const read = sourceOf(sources);
 
   const patches = {
-    proof: read('../proof-preset/cordis.patch.yml'),
+    proof: read('proof:cordis.patch.yml'),
     deliberate: read('cordis.patch.yml'),
   };
   let packages = { proof: { files: [] }, deliberate: { files: [] } };
   try {
     packages = {
-      proof: JSON.parse(read('../proof-preset/package.json')),
+      proof: JSON.parse(read('proof:package.json')),
       deliberate: JSON.parse(read('package.json')),
     };
     check('package.json 合法 JSON', true, 'proof/deliberate 均可解析');
@@ -403,10 +445,22 @@ function runChecks(sources) {
     'proof / deliberate');
 
   for (const mode of ['proof', 'deliberate']) {
-    const rows = topLevelRows(patches[mode]).filter(row => row !== 'persona' && row !== 'loop-guard');
-    check(`${mode} 的 23 行工具组合未变`,
-      rows.length === GOLDEN_ROWS.length && rows.every((row, index) => row === GOLDEN_ROWS[index]),
-      `实际 ${rows.length} 行：${rows.join(',')}`);
+    const baseline = BASELINE_ROWS[mode];
+    const added = ADDED_ROWS[mode];
+    // 顶层行里去掉 persona，再按「本次有意新增」拆成原始项与新增项两部分。
+    const rows = topLevelRows(patches[mode]).filter(row => row !== 'persona');
+    const original = rows.filter(row => !added.includes(row));
+    const present = added.filter(row => rows.includes(row));
+    const missing = added.filter(row => !rows.includes(row));
+    check(`${mode} 原始 ${baseline.length} 项工具组合未变`,
+      original.length === baseline.length && original.every((row, index) => row === baseline[index]),
+      original.length === baseline.length
+        ? `顺序一致：${original.join(',')}`
+        : `实际 ${original.length} 行：${original.join(',')}`);
+    check(`${mode} 新增项`,
+      true, // 有意新增，不计入原始组合，也不判失败
+      `本次有意新增：${present.join('、') || '（无）'}；原始 ${baseline.length} 项另行校验`
+        + (missing.length > 0 ? `；未见 ${missing.join('、')}` : ''));
   }
 
   for (const mode of ['proof', 'deliberate']) {
@@ -436,17 +490,19 @@ function runChecks(sources) {
     deliberateWords.filter(word => !deliberatePersona.suffix.includes(word)).join(',') || 'ok');
 
   // ── R1：两个 preset 都必须挂上 loop-guard，且 proof 不能留旧守卫 ──────────
-  const guards = { proof: read('../proof-preset/loop-guard.cjs'), deliberate: read('loop-guard.cjs') };
-  const memories = { proof: read('../proof-preset/memory.cjs'), deliberate: read('memory.cjs') };
+  const guards = { proof: read('proof:loop-guard.cjs'), deliberate: read('loop-guard.cjs') };
+  const memories = { proof: read('proof:memory.cjs'), deliberate: read('memory.cjs') };
   for (const mode of ['proof', 'deliberate']) {
     const patch = patches[mode];
     check(`${mode} 注册了 loop-guard`,
       new RegExp('^ {10}- id: loop-guard$', 'm').test(patch) &&
       patch.includes(`@local/dsh-${mode}-preset/loop-guard.cjs`),
       `cordis.patch.yml 的 loop-guard 行与包名`);
+    const guardAt = patch.search(/^ {10}- id: loop-guard$/m);
+    const memoryAt = patch.search(/^ {10}- id: session-memory$/m);
     check(`${mode} 的 loop-guard 在 session-memory 之前`,
-      patch.search(/^ {10}- id: loop-guard$/m) < patch.search(/^ {10}- id: session-memory$/m),
-      '先注册 hook 再注册断点');
+      guardAt > 0 && memoryAt > 0 && guardAt < memoryAt,
+      memoryAt < 0 ? '缺少 session-memory 行（断点工具会一起消失）' : '先注册 hook 再注册断点');
     check(`${mode} memory.cjs 已删除旧防循环守卫`,
       !/ctx\.tools\.guard/.test(memories[mode]) && !/REPEATED_IDENTICAL_FAILURE/.test(memories[mode]),
       '无 ctx.tools.guard / 无拒绝码');
@@ -542,7 +598,7 @@ function runChecks(sources) {
 
   // ── R7 / R9 / R12：文档与版本 ────────────────────────────────────────────
   for (const mode of ['proof', 'deliberate']) {
-    const readme = read(mode === 'proof' ? '../proof-preset/README.md' : 'README.md');
+    const readme = read(mode === 'proof' ? 'proof:README.md' : 'README.md');
     check(`${mode} README 有配置表`,
       readme.includes('threshold') && readme.includes('selfCheckEvery') && readme.includes('默认'),
       '配置项 / 默认值 / 含义 / 如何改');
@@ -562,9 +618,18 @@ function runChecks(sources) {
     Boolean(versions.proof) && versions.proof === versions.deliberate && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/.test(versions.proof),
     `proof ${versions.proof} / deliberate ${versions.deliberate}`);
   check('版本号与 CHANGELOG 对应',
-    Boolean(versions.proof) && read('../proof-preset/CHANGELOG.md').includes('## ' + versions.proof) &&
+    Boolean(versions.proof) && read('proof:CHANGELOG.md').includes('## ' + versions.proof) &&
     read('CHANGELOG.md').includes('## ' + versions.deliberate),
     `CHANGELOG 有 ${versions.proof} 段落`);
+
+  // ── F2：工具组合的表述必须分 preset，不能写笼统的「23 行不变」 ────────────
+  const proofLog = read('proof:CHANGELOG.md');
+  const deliberateLog = read('CHANGELOG.md');
+  check('工具组合表述按 preset 分开',
+    proofLog.includes('proof 原始 23 项') && deliberateLog.includes('deliberate 原始 22 项') &&
+    !proofLog.includes('原始 23 行工具组合不变') && !deliberateLog.includes('原始 23 行工具组合不变') &&
+    !read('proof:README.md').includes('工具组合行未变') && !read('README.md').includes('工具组合行未变'),
+    'proof 23 项 / deliberate 22 项，新增项单列');
 
   return checks;
 }
@@ -619,11 +684,21 @@ const NEGATIVE_CASES = [
     },
     expect: '版本号与 CHANGELOG 对应',
   },
+  {
+    name: 'deliberate 原始组合少一行（tool-office 被改名）',
+    mutate: sources => { sources.deliberatePatch = sources.deliberatePatch.replace('- id: tool-office', '- id: tool-office-v2'); },
+    expect: 'deliberate 原始 22 项工具组合未变',
+  },
+  {
+    name: 'CHANGELOG 写回笼统的“23 行不变”',
+    mutate: sources => { sources.deliberateChangelog = sources.deliberateChangelog.replace('deliberate 原始 22 项', '原始 23 行工具组合不变'); },
+    expect: '工具组合表述按 preset 分开',
+  },
 ];
 
 /** 不需要 dsh：先确认正向全过，再确认每条负向用例都被判失败。 */
-function selfTest() {
-  const base = collectSources();
+function selfTest(proofDir = DEFAULT_PROOF_DIR) {
+  const base = collectSources(PRESET_DIR, proofDir);
   const positives = runChecks(base);
   const failed = positives.filter(check => !check.ok);
   for (const check of positives) console.log(`  [${check.ok ? 'OK' : 'FAIL'}] ${check.name}（${check.detail}）`);
@@ -658,10 +733,10 @@ function selfTest() {
   return 0;
 }
 
-async function runStatic(dshPath) {
-  const checks = runChecks(collectSources());
+async function runStatic(dshPath, proofDir = DEFAULT_PROOF_DIR) {
+  const checks = runChecks(collectSources(PRESET_DIR, proofDir));
   const dumps = [
-    ['proof', path.join(PRESET_DIR, '..', 'proof-preset', 'cordis.patch.yml')],
+    ['proof', path.join(proofDir, 'cordis.patch.yml')],
     ['deliberate', PATCH_PATH],
   ];
   for (const [mode, patchPath] of dumps) {
@@ -1208,12 +1283,41 @@ function updateEvaluation(results, meta) {
 
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 
+/** --proof-dir > DSH_PROOF_DIR > 默认的 ../proof-preset。 */
+function resolveProofDir(cliValue) {
+  return path.resolve(cliValue || process.env.DSH_PROOF_DIR || DEFAULT_PROOF_DIR);
+}
+
+/**
+ * 静态断言开始前先确认 proof 目录真的可读。
+ * 以前读不到会返回空串，喂给断言后变成一串「proof 缺关键词」的模糊误失败。
+ */
+function assertProofDir(proofDir) {
+  const patch = path.join(proofDir, 'cordis.patch.yml');
+  if (fs.existsSync(patch)) return '';
+  return [
+    `找不到 proof preset 的 cordis.patch.yml：${patch}`,
+    '用 --proof-dir <path> 或环境变量 DSH_PROOF_DIR 指定 proof preset 目录，例如：',
+    '  node evaluate.cjs --proof-dir ../dsh-proof-preset --static',
+    `（默认值是与本仓库并排的 ${path.relative(process.cwd(), DEFAULT_PROOF_DIR) || DEFAULT_PROOF_DIR}）`,
+  ].join('\n');
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  const proofDir = resolveProofDir(options.proofDir);
+
+  // 先确认 proof 目录存在：读不到就直接报错退出，不把空串喂给断言。
+  const proofError = assertProofDir(proofDir);
+  if (proofError) {
+    console.error(proofError);
+    process.exitCode = 2; // 2 = 无法运行（路径/环境问题）
+    return;
+  }
 
   // R10：负向自检不需要 dsh，也不读 EVALUATION.md。
   if (options.selfTest) {
-    process.exitCode = selfTest();
+    process.exitCode = selfTest(proofDir);
     return;
   }
 
@@ -1226,8 +1330,9 @@ async function main() {
     return;
   }
   console.log(`DSH: ${dshPath}`);
+  console.log(`proof preset: ${proofDir}`);
 
-  const staticChecks = await runStatic(dshPath);
+  const staticChecks = await runStatic(dshPath, proofDir);
   for (const check of staticChecks) console.log(`  [${check.ok ? 'OK' : 'FAIL'}] ${check.name}（${check.detail}）`);
   const staticFailed = staticChecks.filter(check => !check.ok);
   if (staticFailed.length > 0) {

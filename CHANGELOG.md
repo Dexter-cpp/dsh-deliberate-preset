@@ -1,5 +1,14 @@
 # 更新记录
 
+## 1.3.1
+
+第四轮审查（F1–F3）：只修评测器与文档，运行时（`loop-guard.cjs` / `memory.cjs`）未改。
+
+- **F1 工具组合基准拆开**：`evaluate.cjs` 不再用一份 23 项清单同时校验两个 preset。改成 `PROOF_BASELINE_ROWS`（proof 原始 23 项，含 `session-memory`）+ `DELIBERATE_BASELINE_ROWS`（deliberate 原始 22 项）+ 新增白名单（proof：`loop-guard`；deliberate：`loop-guard`、`session-memory`）。原始项必须完整且顺序不变，新增项单独报告、不算失败。旧写法会把「deliberate 新增 `session-memory`」当成「本来就有、必须匹配」，等于把新增当成基准。
+- **F2 表述改准**：CHANGELOG/README 不再写笼统的「23 行工具组合不变」这类说法，改成 proof 原始 23 项 / deliberate 原始 22 项 + 新增项；新增静态断言 `工具组合表述按 preset 分开` 守着。
+- **F3 proof 路径可配**：`evaluate.cjs` 不再硬编码 `../proof-preset`，改用 `--proof-dir <path>` 或 `DSH_PROOF_DIR`；读不到 `<proof-dir>/cordis.patch.yml` 时在静态断言开始前报明确错误并以退出码 `2` 结束，不再把空串喂给断言、产出一串模糊误失败。`read()` 的逻辑键从 `'../proof-preset/x'` 改成 `'proof:x'`，避免被误读成真实路径。
+- 静态断言 47 → 50 项，负向自检 9 → 11 条（新增「原始组合少一行」「CHANGELOG 写回笼统说法」两条）。
+
 ## 1.3.0
 
 第二轮 / 第三轮审查（R1–R12）的收尾版本。
@@ -21,13 +30,13 @@
 ## 1.2.0-beta.2
 
 - 防循环从纯提示词升级为运行时硬拦截：新增 `loop-guard.cjs`，承接 `memory.cjs` 原有的三次守卫（同工具 + 同参数 + 同错误，`REPEATED_IDENTICAL_FAILURE`），N 可配置（默认 3），并补充输出 hash 与每 N 个用户轮次的事前自检注入。`memory.cjs` 只保留断点，删除重复守卫，避免两份计数器。
-- 新增 `evaluate.cjs`：先跑静态断言（两个 YAML/JSON 可解析、preset ID 未变、原始 23 行工具组合未变、persona 关键词、hook/断点落盘），再批量跑 19 个行为用例；状态按「自动通过 / 自动失败 / 待人工复测」三态回填，明确「脚本判定≠真实通过」。
+- 新增 `evaluate.cjs`：先跑静态断言（两个 YAML/JSON 可解析、preset ID 未变、工具组合按 preset 分列校验、persona 关键词、hook/断点落盘），再批量跑 19 个行为用例；状态按「自动通过 / 自动失败 / 待人工复测」三态回填，明确「脚本判定≠真实通过」。
 - 断点改为落盘：`<DSH_HOME>/checkpoints/<profile>/<hash>.json`，schema 固定；临时文件 + 原子 rename，一个会话单写者；多 profile 分目录；与 `sessionProjections` 并存（文件持久层 + 投影即时提示）。
 - 代价估算加入三个量化维度：改动文件数、预计轮次、是否不可逆。
 - 施工图每块必须写可检验的通过条件，并与 `EVALUATION.md` 判据对齐。
 - 两个 preset 的 prefix 增加问题重述与「先列 2–3 个方向，其中至少一个反直觉/逆向/极端」；suffix 增加「不强制套固定结构」。
 - 防循环段加入事前自检；deliberate 由 hook 每 N 个用户轮次真正计数并注入，proof 使用阶段/卡住等自然锚点。
-- 保持预设 ID 与原始 23 行工具组合不变。
+- 保持预设 ID 不变；proof 原始 23 项工具组合不变，deliberate 由 22 项增至 23 项（新增 `session-memory` 承载 `deliberate_checkpoint`），另两个 preset 各新增 `loop-guard`。
 
 ## 1.1.0-beta.2
 
@@ -43,13 +52,13 @@
 - 用有证据的反对与用户选择后的推进，替换“审议者而非执行者”的身份冲突。
 - 保留三次失败换策略，补充实质进展定义、循环误判防护及跨策略止损。
 - 合并重复阶段汇报；不机械拆块、不为结尾模板编造风险。
-- 保持 23 项工具组合与预设 ID 不变；新增待复测用例，原版测试结果不沿用为新版通过。
+- 保持 proof 23 项、deliberate 22 项的工具组合与预设 ID 不变；新增待复测用例，原版测试结果不沿用为新版通过。
 
 ## 1.0.0 — 2026-11-23
 
 - 首次公开发布“权衡”模式，预设 ID 为 `deliberate`。
 - 配置九节工作规则：开场评估、反对与换路、显式假设、阶段闸门、防循环、收工验证、简单任务豁免、施工图和决策日志。
-- 保留原始 23 项工具组合快照，未改动模式行为。
+- 保留原始工具组合快照（proof 23 项、deliberate 22 项），未改动模式行为。
 - 补齐中文安装、使用示例、卸载、兼容性和局限说明。
 
 - 补充作者已通过空转、歧义和反驳三项行为测试的状态，区分作者验证与发布静态检查。

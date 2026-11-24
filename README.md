@@ -1,6 +1,8 @@
 # 权衡 · DSH 本地版
 
-版本 1.3.0。适用于方案选择、实施与排障。
+版本 1.3.1。适用于方案选择、实施与排障。
+
+工具组合：原始 22 项（不含 `session-memory`）保持不变，另新增 `loop-guard` 与 `session-memory`（后者承载 `deliberate_checkpoint` 断点，是 22→23 的那一行）。
 
 ## 防循环（运行时硬拦截）
 
@@ -78,7 +80,7 @@ Remove-Item "$env:DSH_HOME\checkpoints\<profile>\*.corrupt-*.json"
 
 `EVALUATION.md` 的 19 个用例由 `evaluate.cjs` 跑两层：
 
-1. **静态断言**（可自动判定）：两个 `cordis.patch.yml` 可解析、两个 `package.json` 合法、preset ID 仍为 `proof`/`deliberate`、工具组合行未变、两个 preset 都注册了 `loop-guard`、proof 的 `memory.cjs` 无旧守卫、B1/C2 计数器独立、hook 异常降级、配置校验、断点过滤与容错、C1/C3/C4 语义一致、README 无过时表述、版本号与 CHANGELOG 对应。
+1. **静态断言**（可自动判定）：两个 `cordis.patch.yml` 可解析、两个 `package.json` 合法、preset ID 仍为 `proof`/`deliberate`、**工具组合按 preset 分列**（proof 原始 23 项 / deliberate 原始 22 项必须完整且顺序不变，新增项单列报告、不算失败）、两个 preset 都注册了 `loop-guard`、proof 的 `memory.cjs` 无旧守卫、B1/C2 计数器独立、hook 异常降级、配置校验、断点过滤与容错、C1/C3/C4 语义一致、README 无过时表述、版本号与 CHANGELOG 对应。
 2. **模型行为采集**（脚本喂 DSH、收输出）：只做能确定性核验的判定（文件是否改对、命令是否通过、是否出现 `REPEATED_IDENTICAL_FAILURE`、是否出现与要求相悖的措辞等），其余才写「待人工复测」。状态列是三态：**自动通过 / 自动失败 / 待人工复测**；脚本判定不等于真实通过。
 
 静态断言本身是关键词匹配，措辞一改就可能误判，所以 `--self-test` 会拿一组**故意改坏的副本**跑同一套断言，确认它们真的会判失败——断言不会“怎么改都通过”。
@@ -89,9 +91,12 @@ node evaluate.cjs --self-test       # 静态断言的负向自检（不需要 ds
 node evaluate.cjs                   # 静态断言 + 19 个行为用例
 node evaluate.cjs --only 1,8,15     # 只跑指定行为用例
 node evaluate.cjs --dry-run         # 只打印覆盖层和用例清单
+node evaluate.cjs --proof-dir ../dsh-proof-preset   # proof 目录不叫 ../proof-preset 时指定
 ```
 
-退出码：`0` = 全部通过；`1` = 有断言/用例失败，或负向用例没被识别；`2` = 无法运行（参数错误、找不到 dsh）。
+proof 目录默认是并排的 `../proof-preset`，也可以用环境变量 `DSH_PROOF_DIR` 指定。读不到 `<proof-dir>/cordis.patch.yml` 时，脚本在静态断言开始前直接报错退出，不会把空串喂给断言。
+
+退出码：`0` = 全部通过；`1` = 有断言/用例失败，或负向用例没被识别；`2` = 无法运行（参数错误、找不到 dsh、找不到 proof 目录）。
 
 评测会真实消耗模型额度；原始会话记录保存在 `.eval/`（已 gitignore）。
 
